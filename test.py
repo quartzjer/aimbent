@@ -8,20 +8,16 @@ import sys
 import signal
 from io import BytesIO
 from dotenv import load_dotenv
+import argparse
 
-# Load environment variables from a .env file
 load_dotenv()
 
-# Constants
 WEBSOCKET_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01"
-
-# Audio Configuration
-AUDIO_FORMAT = pyaudio.paInt16  # 16-bit PCM
+AUDIO_FORMAT = pyaudio.paInt16
 CHANNELS = 1
-RATE = 24000  # 24kHz
-CHUNK = 1024  # Number of frames per buffer
+RATE = 24000
+CHUNK = 1024
 
-# Global flag for interruption
 interrupted = False
 
 def signal_handler(sig, frame):
@@ -30,18 +26,13 @@ def signal_handler(sig, frame):
     print("\nExiting...")
     sys.exit(0)
 
-# Register the signal handler for graceful shutdown
 signal.signal(signal.SIGINT, signal_handler)
 
 class AudioPlayer:
     def __init__(self):
         self.p = pyaudio.PyAudio()
         try:
-            self.stream = self.p.open(format=AUDIO_FORMAT,
-                                      channels=CHANNELS,
-                                      rate=RATE,
-                                      output=True,
-                                      frames_per_buffer=CHUNK)
+            self.stream = self.p.open(format=AUDIO_FORMAT, channels=CHANNELS, rate=RATE, output=True, frames_per_buffer=CHUNK)
         except Exception as e:
             print(f"Failed to open audio stream: {e}")
             sys.exit(1)
@@ -67,11 +58,7 @@ class AudioSender:
         self.ws = ws
         self.p = pyaudio.PyAudio()
         try:
-            self.stream = self.p.open(format=AUDIO_FORMAT,
-                                      channels=CHANNELS,
-                                      rate=RATE,
-                                      input=True,
-                                      frames_per_buffer=CHUNK)
+            self.stream = self.p.open(format=AUDIO_FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
         except Exception as e:
             print(f"Failed to open microphone stream: {e}")
             sys.exit(1)
@@ -81,29 +68,22 @@ class AudioSender:
     def start(self):
         self.running = True
         self.thread.start()
-        print("Started sending audio from the microphone.")
 
     def send_audio(self):
         try:
             while self.running and not interrupted:
                 data = self.stream.read(CHUNK, exception_on_overflow=False)
                 audio_base64 = base64.b64encode(data).decode('utf-8')
-                audio_event = {
-                    "type": "input_audio_buffer.append",
-                    "audio": audio_base64  # Corrected key name
-                }
+                audio_event = {"type": "input_audio_buffer.append", "audio": audio_base64}
                 self.ws.send(json.dumps(audio_event))
         except Exception as e:
             print(f"Error capturing/sending audio: {e}")
             self.running = False
 
     def commit_buffer(self):
-        commit_event = {
-            "type": "input_audio_buffer.commit"
-        }
+        commit_event = {"type": "input_audio_buffer.commit"}
         try:
             self.ws.send(json.dumps(commit_event))
-            print("Committed audio buffer.")
         except Exception as e:
             print(f"Failed to commit audio buffer: {e}")
 
@@ -114,7 +94,6 @@ class AudioSender:
             self.stream.stop_stream()
             self.stream.close()
             self.p.terminate()
-            print("Stopped sending audio.")
         except Exception as e:
             print(f"Error closing microphone stream: {e}")
 
@@ -132,30 +111,20 @@ class ChatStreaming:
             print(f"[DEBUG] {message}")
 
     def on_open(self, ws):
-        print("Connected to server.")
-        # Initialize and start audio sending
         self.audio_sender = AudioSender(ws)
         self.audio_sender.start()
-
-        # Send session.update to initialize the session
         session_update_message = {
             "type": "session.update",
             "session": {
                 "modalities": ["text"],
                 "instructions": "You will be listening to a conversation, your job is to notice when you can be helpful and offer suggestions. You are not part of the conversation, you are only an observer.",
-                "input_audio_transcription": {
-                    "model": "whisper-1"
-                },
-                "turn_detection": {
-                    "type": "server_vad",
-                    "threshold": 0.8,
-                },
+                "input_audio_transcription": {"model": "whisper-1"},
+                "turn_detection": {"type": "server_vad", "threshold": 0.8},
                 "temperature": 0.7,
                 "max_response_output_tokens": 500
             }
         }
         ws.send(json.dumps(session_update_message))
-        print("Session initialized.")
 
     def on_message(self, ws, message):
         try:
@@ -204,29 +173,19 @@ class ChatStreaming:
             "item": {
                 "type": "message",
                 "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": message
-                    }
-                ]
+                "content": [{"type": "input_text", "text": message}]
             }
         }
         try:
             self.ws.send(json.dumps(event))
-            print("Sending your message...")
             self.log(f"Sent user message: {message}")
         except Exception as e:
             print(f"Failed to send message: {e}")
             self.log(f"Failed to send message: {e}")
 
-        # Send response.create to trigger the assistant's response
         response_create_event = {
             "type": "response.create",
-            "response": {
-                "modalities": ["text"],
-                "instructions": "Please assist the user."
-            }
+            "response": {"modalities": ["text"], "instructions": "Please assist the user."}
         }
         try:
             self.ws.send(json.dumps(response_create_event))
@@ -236,23 +195,11 @@ class ChatStreaming:
             self.log(f"Failed to send response.create: {e}")
 
     def run(self):
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "OpenAI-Beta": "realtime=v1"
-        }
-
-        self.ws = websocket.WebSocketApp(WEBSOCKET_URL,
-                                         header=headers,
-                                         on_open=self.on_open,
-                                         on_message=self.on_message,
-                                         on_error=self.on_error,
-                                         on_close=self.on_close)
-
-        # Run WebSocket in a separate thread
+        headers = {"Authorization": f"Bearer {self.api_key}", "OpenAI-Beta": "realtime=v1"}
+        self.ws = websocket.WebSocketApp(WEBSOCKET_URL, header=headers, on_open=self.on_open, on_message=self.on_message, on_error=self.on_error, on_close=self.on_close)
         wst = threading.Thread(target=self.ws.run_forever, daemon=True)
         wst.start()
 
-        # Wait until the WebSocket connection is established
         while not self.ws.sock or not self.ws.sock.connected:
             pass
 
@@ -278,12 +225,16 @@ class ChatStreaming:
         self.audio_player.close()
 
 def main():
+    parser = argparse.ArgumentParser(description="OpenAI Chat with Audio Streaming")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
+    args = parser.parse_args()
+
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         print("Error: OPENAI_API_KEY environment variable not set.")
         sys.exit(1)
 
-    chat = ChatStreaming(api_key, verbose=False)
+    chat = ChatStreaming(api_key, verbose=args.verbose)
     chat.run()
 
 if __name__ == "__main__":
