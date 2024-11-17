@@ -19,9 +19,7 @@ class AudioPlayer:
             format=pyaudio.paInt16,
             channels=1,
             rate=24000,
-            output=True,
-            frames_per_buffer=4800,
-            output_device_index=None
+            output=True
         )
         print(f"Audio initialized with default output device")
 
@@ -47,7 +45,7 @@ class WHIPHandler:
 
     async def handle_audio_track(self, track: MediaStreamTrack):
         print(f"Handling audio track: {track.kind}")
-        print(f"Track settings: {track.kind} {getattr(track, 'id', 'N/A')}")
+        print(f"Track settings: {track.kind}, ID: {getattr(track, 'id', 'N/A')}")
 
         resampler = av.AudioResampler(
             format='s16',
@@ -55,31 +53,26 @@ class WHIPHandler:
             rate=24000
         )
 
-        buffer = b''
-        min_buffer_size = 4800
         frame_count = 0
 
         while not self.connection_closed.is_set():
             try:
                 frame = await track.recv()
-                print(f"Received frame: samples={frame.samples}")
                 frame_count += 1
 
                 resampled_frames = resampler.resample(frame)
+                if not resampled_frames:
+                    continue
 
                 for resampled_frame in resampled_frames:
-                    audio_data = bytes(resampled_frame.planes[0])
-                    buffer += audio_data
-
-                    if len(buffer) >= min_buffer_size:
-                        self.audio_player.play(buffer)
-                        buffer = b''
+                    audio_data = resampled_frame.to_ndarray().tobytes()
+                    self.audio_player.play(audio_data)
 
                 if frame_count % 100 == 0:
                     print(f"Processed {frame_count} frames")
 
             except Exception as e:
-                print(f"Error receiving audio frame: {e}")
+                print(f"Error receiving or processing audio frame: {e}")
                 break
 
     async def run(self):

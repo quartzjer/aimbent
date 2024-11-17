@@ -40,8 +40,6 @@ class WHIPHandler:
             rate=24000
         )
 
-        buffer = b''
-        min_buffer_size = 4800
         frame_count = 0
 
         while not self.connection_closed.is_set():
@@ -50,14 +48,9 @@ class WHIPHandler:
                 frame_count += 1
 
                 resampled_frames = resampler.resample(frame)
-
                 for resampled_frame in resampled_frames:
-                    audio_data = bytes(resampled_frame.planes[0])
-                    buffer += audio_data
-
-                    if len(buffer) >= min_buffer_size:
-                        await self.audio_queue.put(buffer)
-                        buffer = b''
+                    audio_data = resampled_frame.to_ndarray().tobytes()
+                    await self.audio_queue.put(audio_data)
 
                 if frame_count % 100 == 0:
                     print(f"Processed {frame_count} frames")
@@ -113,7 +106,7 @@ class WHIPHandler:
                 sent_count += 1
                 if sent_count % 100 == 0:
                     commit_event = {"type": "input_audio_buffer.commit"}
-                    await self.websocket.send_json(commit_event)
+                    #await self.websocket.send_json(commit_event)
                     print(f"Committed {sent_count} buffers")
         except asyncio.CancelledError:
             pass
@@ -126,7 +119,12 @@ class WHIPHandler:
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     event = json.loads(msg.data)
                     event_type = event.get('type')
-                    print(f"Received event: {event_type}")
+                    print(f"Received event: {event_type}")#, msg.data)
+                    if event_type == "response.text.done":
+                        text = event.get("text", "")
+                        if text:
+                            print(f"Aimbe: {text}", end='', flush=True)
+
                 elif msg.type == aiohttp.WSMsgType.ERROR:
                     break
         except asyncio.CancelledError:
