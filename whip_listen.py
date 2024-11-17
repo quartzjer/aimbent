@@ -18,10 +18,19 @@ SERVER_PORT = 8080
 WHIP_ENDPOINT = "/whip"
 WEBSOCKET_URL = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01"
 
+# Add global connection tracking
+pcs = set()
+pcs_by_resource_id = {}
+handlers_by_resource_id = {}
+
 class WHIPHandler:
 
     def __init__(self, offer: RTCSessionDescription):
+        # Configure DTLS role
         self.pc = RTCPeerConnection()
+        # Only add audio transceiver, set to recvonly
+        self.pc.addTransceiver("audio", direction="recvonly")
+        
         self.offer = offer
         self.id = uuid.uuid4()
         self.connection_closed = asyncio.Event()
@@ -77,21 +86,25 @@ class WHIPHandler:
             }
         }
 
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.ws_connect(WEBSOCKET_URL) as ws:
-                self.websocket = ws
-                await ws.send_json(session_update_message)
-                print("WebSocket connection established and session updated.")
+        try:
+            async with aiohttp.ClientSession(headers=headers) as session:
+                async with session.ws_connect(WEBSOCKET_URL) as ws:
+                    self.websocket = ws
+                    await ws.send_json(session_update_message)
+                    print("WebSocket connection established and session updated.")
 
-                send_task = asyncio.create_task(self.send_audio_data())
-                receive_task = asyncio.create_task(self.receive_messages())
+                    send_task = asyncio.create_task(self.send_audio_data())
+                    receive_task = asyncio.create_task(self.receive_messages())
 
-                await self.connection_closed.wait()
+                    await self.connection_closed.wait()
 
-                send_task.cancel()
-                receive_task.cancel()
-                await ws.close()
-                print("WebSocket connection closed.")
+                    send_task.cancel()
+                    receive_task.cancel()
+                    await ws.close()
+                    print("WebSocket connection closed.")
+        except Exception as e:
+            print(f"Error in start_websocket: {e}")
+            self.connection_closed.set()
 
     async def send_audio_data(self):
         try:
@@ -131,6 +144,12 @@ class WHIPHandler:
             pass
         except Exception as e:
             print(f"Error in receive_messages: {e}")
+            self.connection_closed.set()
+
+    async def _wait_for_ice_gathering(self):
+        """Wait for ICE gathering to complete."""
+        while self.pc.iceGatheringState != "complete":
+            await asyncio.sleep(0.1)
 
     async def run(self):
         @self.pc.on("connectionstatechange")
@@ -141,54 +160,94 @@ class WHIPHandler:
 
         @self.pc.on("track")
         async def on_track(track):
-            print(f"Received track: {track.kind}")
             if track.kind == "audio":
+                print(f"Received audio track")
                 asyncio.create_task(self.handle_audio_track(track))
-            else:
-                print(f"Ignoring track of kind: {track.kind}")
 
         await self.pc.setRemoteDescription(self.offer)
         print("Set remote description.")
 
         answer = await self.pc.createAnswer()
         await self.pc.setLocalDescription(answer)
+        
+        # Wait for ICE gathering to complete
+        await self._wait_for_ice_gathering()
+        
         print("Created and set local description (answer).")
-
         asyncio.create_task(self.start_websocket())
 
     async def close(self):
         await self.pc.close()
+        pcs.discard(self.pc)
+        pcs_by_resource_id.pop(str(self.id), None)
+        handlers_by_resource_id.pop(str(self.id), None)
         print(f"WHIPHandler {self.id} closed.")
 
 async def handle_whip(request):
+    # Add CORS headers
+    if request.method == "OPTIONS":
+        response = web.Response(status=204)
+        response.headers.update({
+            'Access-Control-Allow-Methods': 'OPTIONS, POST',
+            'Access-Control-Allow-Headers': 'Content-Type',
+            'Access-Control-Max-Age': '86400',
+        })
+        return response
+
     if request.method != "POST":
         return web.Response(status=405, text="Method Not Allowed")
 
     try:
-        offer_json = await request.json()
-        print(f"Received WHIP offer: {offer_json}")
-    except json.JSONDecodeError:
-        return web.Response(status=400, text="Invalid JSON")
+        content_type = request.headers.get('Content-Type', '').lower()
+        if content_type == 'application/sdp':
+            sdp_content = await request.text()
+            offer_json = {
+                "type": "offer",
+                "sdp": sdp_content
+            }
+        elif content_type == 'application/json':
+            offer_json = await request.json()
+        else:
+            return web.Response(
+                status=415,
+                text=f"Unsupported Content-Type: {content_type}. Expected application/sdp or application/json"
+            )
+
+        print(f"Processed offer: {offer_json}")
+    except Exception as e:
+        print(f"Error processing request: {e}")
+        return web.Response(status=400, text=str(e))
 
     handler = None
 
     try:
-        offer = RTCSessionDescription(sdp=offer_json.get("sdp"), type=offer_json.get("type"))
+        offer = RTCSessionDescription(sdp=offer_json.get("sdp"), type=offer_json.get("type", "offer"))
 
         handler = WHIPHandler(offer)
-        if handler.connection_closed.is_set():
-            return web.Response(status=500, text="Server Error: API key not set.")
+        resource_id = str(handler.id)
+        
+        # Track connections
+        pcs.add(handler.pc)
+        pcs_by_resource_id[resource_id] = handler.pc
+        handlers_by_resource_id[resource_id] = handler
 
         await handler.run()
 
-        answer = {
-            "type": handler.pc.localDescription.type,
-            "sdp": handler.pc.localDescription.sdp,
-        }
-
-        print(f"Sending WHIP answer: {answer}")
-
-        return web.json_response(answer)
+        # No need to modify SDP since we're already configured for receive-only
+        answer_sdp = handler.pc.localDescription.sdp
+        
+        # Return the answer with the correct content type and CORS headers
+        response = web.Response(
+            content_type='application/sdp',
+            text=answer_sdp,
+            status=201  # Created
+        )
+        response.headers.update({
+            'Location': f'{WHIP_ENDPOINT}/{resource_id}',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Expose-Headers': 'Location'
+        })
+        return response
 
     except Exception as e:
         print(f"Error in WHIP handler: {e}")
@@ -196,10 +255,41 @@ async def handle_whip(request):
             await handler.close()
         return web.Response(status=500, text=str(e))
 
+async def handle_delete(request):
+    resource_id = request.match_info['resource_id']
+    handler = handlers_by_resource_id.get(resource_id)
+    if handler:
+        await handler.close()
+        return web.Response(status=200)
+    return web.Response(status=404)
+
+async def on_shutdown(app):
+    # Close all peer connections
+    coros = [handler.close() for handler in handlers_by_resource_id.values()]
+    await asyncio.gather(*coros)
+    pcs.clear()
+    pcs_by_resource_id.clear()
+    handlers_by_resource_id.clear()
+
+async def debug_request(request):
+    print(f"\nDEBUG: {request.method} {request.path}")
+    print("Headers:")
+    for name, value in request.headers.items():
+        print(f"  {name}: {value}")
+    
+    if request.can_read_body:
+        body = await request.text()
+        print(f"Body: {body}\n")
+    
+    return await handle_whip(request) if request.path == WHIP_ENDPOINT else web.Response(status=404)
+
 def main():
     app = web.Application()
     app.router.add_post(WHIP_ENDPOINT, handle_whip)
-
+    app.router.add_delete(f'{WHIP_ENDPOINT}/{{resource_id}}', handle_delete)
+    app.on_shutdown.append(on_shutdown)
+    app.router.add_route('*', '/{tail:.*}', debug_request)
+    
     print(f"Starting WHIP server on port {SERVER_PORT}, endpoint {WHIP_ENDPOINT}")
     web.run_app(app, port=SERVER_PORT)
 
