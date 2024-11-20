@@ -1,0 +1,7 @@
+aiohttp
+aiortc
+av
+python-dotenv
+pyaudio
+websocket-client
+pyrtmp
