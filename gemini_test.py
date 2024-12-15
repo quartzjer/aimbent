@@ -141,6 +141,10 @@ class GeminiAudioClient:
                                 if data["mimeType"] == "audio/pcm;rate=24000":
                                     audio_data = base64.b64decode(data["data"])
                                     self.output_stream.write(audio_data)
+                    else:
+                        logging.info(f"Received unknown server content: {response}")
+                else:
+                    logging.info(f"Received unknown message: {response}")
                 
             except Exception as e:
                 logging.error(f"Error processing server message: {e}")
