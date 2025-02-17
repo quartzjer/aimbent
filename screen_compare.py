@@ -30,15 +30,20 @@ def compare_images(img1, img2, block_size=50, ssim_threshold=0.90, margin=5):
     # Group contiguous changed blocks using DFS.
     groups = []
     visited = [[False]*grid_cols for _ in range(grid_rows)]
+    
+    # Replace recursive DFS with an iterative version.
     def dfs(i, j, group):
-        if i < 0 or i >= grid_rows or j < 0 or j >= grid_cols:
-            return
-        if visited[i][j] or not changed[i][j]:
-            return
-        visited[i][j] = True
-        group.append((i, j))
-        for ni, nj in [(i-1,j), (i+1,j), (i,j-1), (i,j+1)]:
-            dfs(ni, nj, group)
+        stack = [(i, j)]
+        while stack:
+            ci, cj = stack.pop()
+            if ci < 0 or ci >= grid_rows or cj < 0 or cj >= grid_cols:
+                continue
+            if visited[ci][cj] or not changed[ci][cj]:
+                continue
+            visited[ci][cj] = True
+            group.append((ci, cj))
+            for ni, nj in [(ci-1, cj), (ci+1, cj), (ci, cj-1), (ci, cj+1)]:
+                stack.append((ni, nj))
 
     for i in range(grid_rows):
         for j in range(grid_cols):
