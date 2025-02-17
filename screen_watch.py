@@ -3,11 +3,20 @@ import argparse
 import os
 import time
 import datetime
+import json  # added import
 from PIL import ImageDraw
 from screen_dbus import screen_snap
 from screen_compare import compare_images
+import gemini_look  # added import
 
-def process_screenshots(interval, output_dir, verbose, min_threshold):
+GLOBAL_VERBOSE = False
+
+# Top-level logging utility using global verbosity
+def log(message, force=False):
+    if GLOBAL_VERBOSE or force:
+        print(message)
+
+def process_screenshots(interval, output_dir, min_threshold, use_gemini):  # added use_gemini parameter
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
@@ -23,13 +32,11 @@ def process_screenshots(interval, output_dir, verbose, min_threshold):
                 timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                 filename = os.path.join(output_dir, f"monitor_{idx}_{timestamp}.png")
                 pil_img.save(filename)
-                if verbose:
-                    print(f"[Monitor {idx}] Initial screenshot saved: {filename}")
+                log(f"[Monitor {idx}] Initial screenshot saved: {filename}")
             else:
                 prev_img = prev_images[idx]
                 if prev_img.size != pil_img.size:
-                    if verbose:
-                        print(f"[Monitor {idx}] Size mismatch; updating reference image.")
+                    log(f"[Monitor {idx}] Size mismatch; updating reference image.")
                     prev_images[idx] = pil_img
                     continue
 
@@ -41,27 +48,28 @@ def process_screenshots(interval, output_dir, verbose, min_threshold):
                     box_width = x_max - x_min
                     box_height = y_max - y_min
                     if box_width > min_threshold and box_height > min_threshold:
-                        if verbose:
-                            print(f"[Monitor {idx}] Detected significant difference: {largest_box}")
+                        log(f"[Monitor {idx}] Detected significant difference: {largest_box}")
                         annotated = pil_img.copy()
                         draw = ImageDraw.Draw(annotated)
                         draw.rectangle(((x_min, y_min), (x_max, y_max)), outline="red", width=3)
                         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                         filename = os.path.join(output_dir, f"monitor_{idx}_{timestamp}_diff.png")
                         annotated.save(filename)
-                        print(f"[Monitor {idx}] Saved annotated diff image: {filename}")
+                        log(f"[Monitor {idx}] Saved annotated diff image: {filename}", force=True)
+                        if use_gemini:  # new block for gemini integration
+                            result = gemini_look.gemini_describe_region(pil_img, largest_box)
+                            if result:
+                                json_filename = os.path.splitext(filename)[0] + ".json"
+                                with open(json_filename, "w") as jf:
+                                    json.dump(result, jf, indent=2)
+                                log(f"[Monitor {idx}] Saved Gemini JSON result: {json_filename}", force=True)
                         prev_images[idx] = pil_img  # Update reference image.
                     else:
-                        if verbose:
-                            print(f"[Monitor {idx}] Difference detected but largest box {largest_box} is smaller than threshold.")
+                        log(f"[Monitor {idx}] Difference detected but largest box {box_width}x{box_height} is < {min_threshold}.")
                 else:
-                    if verbose:
-                        print(f"[Monitor {idx}] No significant change detected.")
-        elapsed = time.time() - cycle_start
-        sleep_time = max(0, interval - elapsed)
-        if verbose:
-            print(f"Sleeping for {sleep_time:.2f} seconds before next cycle...\n")
-        time.sleep(sleep_time)
+                    log(f"[Monitor {idx}] No significant change detected.")
+        log(f"Sleeping for {interval:.2f} seconds before next cycle...\n")
+        time.sleep(interval)
 
 def main():
     parser = argparse.ArgumentParser(
@@ -71,8 +79,11 @@ def main():
     parser.add_argument("directory", type=str, help="Directory to save screenshots")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--min", type=int, default=400, help="Minimum size threshold for a bounding box (pixels)")
+    parser.add_argument("-g", "--gemini", action="store_true", help="Call Gemini API when differences are detected")  # added gemini option
     args = parser.parse_args()
-    process_screenshots(args.interval, args.directory, args.verbose, args.min)
+    global GLOBAL_VERBOSE
+    GLOBAL_VERBOSE = args.verbose
+    process_screenshots(args.interval, args.directory, args.min, args.gemini)  # pass gemini flag
 
 if __name__ == '__main__':
     main()
