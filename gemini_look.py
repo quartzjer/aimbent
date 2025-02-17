@@ -36,7 +36,7 @@ def gemini_describe_region(image, box):
                 temperature=0.5,
                 max_output_tokens=8192,
                 response_mime_type="application/json",
-                system_instruction="You analyze screenshots, you will be given a full screenshot with a red box around a region of interest, as well as a cropped image of that region. Return JSON output with the following format and all fields completed: {\"app\": \"<what app is the zommed in region focused on>\", \"rich_description\": \"<describe the zoomed-in region including any visual elements>\", \"full_ocr\": \"<extract ALL of the text from the cropped image with formatting>\"}"
+                system_instruction="You analyze screenshots, you will be given a full screenshot with a red box around a region of interest, as well as a cropped image of that region. Return JSON output with the following format and all fields completed: {\"app\": \"<what app is the zommed in region focused on>\", \"app_title\":\"<any title for the app window in focus>\", \"visual_description\": \"<describe the zoomed-in region with a focus on all visual elements and aspects>\", \"full_ocr\": \"<extract ALL of the text from the cropped image with formatting>\"}"
             )
         )
         return json.loads(response.text)
