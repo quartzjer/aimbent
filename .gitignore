@@ -2,3 +2,5 @@
 .venv
 *.png
 *.mp3
+__pycache__
+*.zip
