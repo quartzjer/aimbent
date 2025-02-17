@@ -25,8 +25,7 @@ def gemini_describe_region(image, box):
         raise ValueError("GOOGLE_API_KEY not found in environment. Please create a .env file.")
     client = genai.Client(api_key=GEMINI_API_KEY)
     prompt = (
-        "Analyze the provided image and its region cut-out. "
-        "Return a JSON object in the format {\"description\": \"...\"} describing the region."
+        "Here is the latest screenshot with the cropped region of interest, please return the complete JSON as instructed."
     )
     try:
         response = client.models.generate_content(
@@ -37,7 +36,7 @@ def gemini_describe_region(image, box):
                 temperature=0.5,
                 max_output_tokens=8192,
                 response_mime_type="application/json",
-                system_instruction="You analyze screenshots, you will be given a full screenshot with a red box around a region of interest, as well as a cropped image of that region. Return JSON output with the following format and all fields completed: {\"app\": \"<what app is the zommed in region focused on>\", \"rich_description\": \"<describe the zoomed-in region including any visual elements>\", \"full_ocr\": \"<all extracted text from the cropped image>\"}"
+                system_instruction="You analyze screenshots, you will be given a full screenshot with a red box around a region of interest, as well as a cropped image of that region. Return JSON output with the following format and all fields completed: {\"app\": \"<what app is the zommed in region focused on>\", \"rich_description\": \"<describe the zoomed-in region including any visual elements>\", \"full_ocr\": \"<extract ALL of the text from the cropped image with formatting>\"}"
             )
         )
         return json.loads(response.text)
