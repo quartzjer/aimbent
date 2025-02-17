@@ -1,4 +1,4 @@
-import asyncio, os, tempfile, io
+import asyncio, os, tempfile, io, time
 from dbus_next.aio import MessageBus
 from dbus_next.constants import BusType
 import gi
@@ -6,8 +6,10 @@ gi.require_version('Gdk', '4.0')
 from gi.repository import Gdk
 from PIL import Image
 
-async def take_screenshot():
-    bus = await MessageBus(bus_type=BusType.SESSION).connect()
+# Global timestamp for the last screenshot (in seconds)
+last_screenshot_timestamp = 0
+
+async def take_screenshot(bus):
     introspection = await bus.introspect('org.gnome.Shell.Screenshot', '/org/gnome/Shell/Screenshot')
     proxy_obj = bus.get_proxy_object('org.gnome.Shell.Screenshot',
                                      '/org/gnome/Shell/Screenshot',
@@ -20,6 +22,15 @@ async def take_screenshot():
         screenshot_bytes = f.read()
     os.remove(temp_path)
     return screenshot_bytes
+
+async def get_idle_time_ms(bus):
+    introspection = await bus.introspect('org.gnome.Mutter.IdleMonitor', '/org/gnome/Mutter/IdleMonitor/Core')
+    proxy_obj = bus.get_proxy_object('org.gnome.Mutter.IdleMonitor',
+                                     '/org/gnome/Mutter/IdleMonitor/Core',
+                                     introspection)
+    idle_monitor = proxy_obj.get_interface('org.gnome.Mutter.IdleMonitor')
+    idle_time = await idle_monitor.call_get_idletime()
+    return idle_time
 
 def get_monitor_geometries():
     # Get the default display. If it is None, try opening one from the environment.
@@ -38,10 +49,19 @@ def get_monitor_geometries():
         geometries.append(geom)
     return geometries
 
-# New: asynchronous snapshot helper that returns an array of monitor images.
+# asynchronous snapshot helper that returns an array of monitor images only if user is active
 async def screen_snap_async():
+    global last_screenshot_timestamp
+    now = time.time()
+    bus = await MessageBus(bus_type=BusType.SESSION).connect()
+    if last_screenshot_timestamp:
+        idle_time_ms = await get_idle_time_ms(bus)
+        elapsed = now - last_screenshot_timestamp
+        if (idle_time_ms / 1000) > elapsed:
+            # User has been idle since before the last screenshot.
+            return []
     # Take the screenshot for all monitors.
-    screenshot_data = await take_screenshot()
+    screenshot_data = await take_screenshot(bus)
     im = Image.open(io.BytesIO(screenshot_data))
     geometries = get_monitor_geometries()
     monitor_images = []
@@ -49,14 +69,13 @@ async def screen_snap_async():
         box = (geom.x, geom.y, geom.x + geom.width, geom.y + geom.height)
         monitor_img = im.crop(box)
         monitor_images.append(monitor_img)
+    last_screenshot_timestamp = now
     return monitor_images
 
-# New: synchronous wrapper to call the asynchronous snapshot.
 def screen_snap():
     return asyncio.run(screen_snap_async())
 
 def main():
-    # Updated main: use screen_snap() and save full images.
     monitor_images = screen_snap()
     for idx, img in enumerate(monitor_images, start=1):
         filename = f"monitor_{idx}.png"
