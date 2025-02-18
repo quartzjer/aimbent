@@ -3,5 +3,5 @@
     "name": "Persistent Unsafe Mode",
     "description": "Enables unsafe mode persistently for screenshot purposes",
     "shell-version": ["47", "48", "49"],
-    "version": 1
+    "version": 2
 }
