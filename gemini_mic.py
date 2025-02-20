@@ -14,9 +14,12 @@ API_KEY = os.getenv("GOOGLE_API_KEY")
 if not API_KEY:
     sys.exit("Error: GOOGLE_API_KEY not found in environment. Please set it in your .env file.")
 
+if len(sys.argv) < 2:
+    sys.exit("Usage: python gemini_mic.py <chunk_duration_seconds>")
+CHUNK_DURATION = float(sys.argv[1])
+
 SAMPLE_RATE = 16000
 CHANNELS = 1
-CHUNK_DURATION = 5.0  # seconds
 
 # Load Silero VAD model and initialize Gemini client
 model = load_silero_vad()
@@ -24,14 +27,13 @@ client = genai.Client(api_key=API_KEY)
 
 def process_audio_chunk(audio_chunk):
     """
-    Encode the given audio chunk as AAC and send it to Gemini for transcription.
+    Encode the given audio chunk as OGG/Vorbis and send it to Gemini for transcription.
     `audio_chunk` here is assumed to be int16 NumPy array.
     """
-    # Convert the NumPy int16 array to AAC using PyAV
+    # Convert the NumPy int16 array to OGG/Vorbis using PyAV
     buf = io.BytesIO()
-    output_container = av.open(buf, mode='w', format='ipod')
-    stream = output_container.add_stream('aac', rate=SAMPLE_RATE)
-    stream.options = {'profile': 'aac_low'}
+    output_container = av.open(buf, mode='w', format='ogg')
+    stream = output_container.add_stream('vorbis', rate=SAMPLE_RATE)
 
     # Create a mono audio frame. If audio_chunk is shape (N,), reshape to (1, N) for PyAV.
     frame = av.AudioFrame.from_ndarray(audio_chunk.reshape(1, -1), format='s16', layout='mono')
@@ -43,10 +45,10 @@ def process_audio_chunk(audio_chunk):
         output_container.mux(packet)
 
     output_container.close()
-    aac_bytes = buf.getvalue()
+    ogg_bytes = buf.getvalue()
 
     duration_sec = len(audio_chunk) / SAMPLE_RATE
-    size_mb = len(aac_bytes) / (1024 * 1024)
+    size_mb = len(ogg_bytes) / (1024 * 1024)
     print(f"Transcribing chunk: {duration_sec:.1f}s, {size_mb:.2f}MB")
 
     prompt_text = "Please transcribe the following audio clip."
@@ -56,8 +58,8 @@ def process_audio_chunk(audio_chunk):
             contents=[
                 prompt_text,
                 types.Part.from_bytes(
-                    data=aac_bytes,
-                    mime_type="audio/aac",
+                    data=ogg_bytes,
+                    mime_type="audio/ogg",
                 )
             ]
         )
@@ -65,8 +67,9 @@ def process_audio_chunk(audio_chunk):
     except Exception as e:
         print(f"Error during transcription: {e}")
 
-# Global buffer to accumulate microphone data as float32 (default for sounddevice)
+# Global buffers for unprocessed audio and new audio count
 global_buffer = np.array([], dtype=np.float32)
+global_new_audio_count = 0
 
 def audio_callback(indata, frames, time, status):
     """
@@ -74,7 +77,7 @@ def audio_callback(indata, frames, time, status):
     Once we exceed CHUNK_DURATION, run VAD over the entire buffer,
     transcribe speech segments, and trim out processed audio.
     """
-    global global_buffer
+    global global_buffer, global_new_audio_count
     if status:
         print(status, file=sys.stderr)
 
@@ -84,11 +87,14 @@ def audio_callback(indata, frames, time, status):
 
     # Append to the global buffer
     global_buffer = np.concatenate((global_buffer, new_audio))
+    global_new_audio_count += len(new_audio)
 
-    # Check if we have at least CHUNK_DURATION seconds in the buffer
-    total_length_sec = len(global_buffer) / SAMPLE_RATE
-    if total_length_sec < CHUNK_DURATION:
-        return  # Not enough data to process yet
+    # Wait until CHUNK_DURATION seconds of new audio have accumulated
+    if global_new_audio_count < CHUNK_DURATION * SAMPLE_RATE:
+        return
+
+    # Reset counter after threshold is met, ensuring we wait CHUNK_DURATION again.
+    global_new_audio_count = 0
 
     # We have enough data to do some VAD
     print("Running VAD on buffered audio...")
@@ -103,38 +109,27 @@ def audio_callback(indata, frames, time, status):
     )
     print(f"Detected {len(speech_segments)} speech segments.")
 
-    # If we found no speech, flush out the oldest chunk's worth
-    if not speech_segments:
-        # Just drop CHUNK_DURATION worth of samples to avoid ballooning the buffer
-        drop_samples = int(CHUNK_DURATION * SAMPLE_RATE)
-        global_buffer = global_buffer[drop_samples:]
+    if len(speech_segments) < 1:
+        # Empty the buffer
+        global_buffer = global_buffer[0:0]
         return
+    elif len(speech_segments) == 1:
+        # Trim off the beginning before the single detected segment.
+        trim_sample = int(speech_segments[0]['start'] * SAMPLE_RATE)
+        global_buffer = global_buffer[trim_sample:]
+        return
+    else:
+        # Build chunk from start of first segment to end of second-last segment.
+        chunk_start = int(speech_segments[0]['start'] * SAMPLE_RATE)
+        chunk_end = int(speech_segments[-2]['end'] * SAMPLE_RATE)
+        chunk = global_buffer[chunk_start:chunk_end]
 
-    # Otherwise, process each segment and track the max end
-    last_end_sample = 0
-    for seg in speech_segments:
-        start_sec = seg['start']
-        end_sec = seg['end']
-        start_sample = int(start_sec * SAMPLE_RATE)
-        end_sample = int(end_sec * SAMPLE_RATE)
-
-        # Only process forward in the buffer (avoid reprocessing if segments overlap)
-        if end_sample <= last_end_sample:
-            continue
-
-        # Clip to not reprocess previously handled frames
-        segment_start = max(start_sample, last_end_sample)
-        segment_end = end_sample
-
-        chunk = global_buffer[segment_start:segment_end]
-        # Convert float to int16 for PyAV:
+        # Convert float data to int16 and process the chunk.
         chunk_int16 = (np.clip(chunk, -1.0, 1.0) * 32767).astype(np.int16)
-
         process_audio_chunk(chunk_int16)
-        last_end_sample = segment_end
 
-    # After processing all segments, remove everything up to last_end_sample
-    global_buffer = global_buffer[last_end_sample:]
+        # Retain incomplete audio containing the last segment
+        global_buffer = global_buffer[chunk_end:]
 
 try:
     with sd.InputStream(channels=CHANNELS, samplerate=SAMPLE_RATE, callback=audio_callback):
