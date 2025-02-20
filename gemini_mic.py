@@ -27,13 +27,14 @@ client = genai.Client(api_key=API_KEY)
 
 def process_audio_chunk(audio_chunk):
     """
-    Encode the given audio chunk as OGG/Vorbis and send it to Gemini for transcription.
+    Encode the given audio chunk as AAC and send it to Gemini for transcription.
     `audio_chunk` here is assumed to be int16 NumPy array.
     """
-    # Convert the NumPy int16 array to OGG/Vorbis using PyAV
+    # Convert the NumPy int16 array to AAC using PyAV
     buf = io.BytesIO()
-    output_container = av.open(buf, mode='w', format='ogg')
-    stream = output_container.add_stream('vorbis', rate=SAMPLE_RATE)
+    output_container = av.open(buf, mode='w', format='ipod')
+    stream = output_container.add_stream('aac', rate=SAMPLE_RATE)
+    stream.options = {'profile': 'aac_low'}
 
     # Create a mono audio frame. If audio_chunk is shape (N,), reshape to (1, N) for PyAV.
     frame = av.AudioFrame.from_ndarray(audio_chunk.reshape(1, -1), format='s16', layout='mono')
@@ -45,10 +46,10 @@ def process_audio_chunk(audio_chunk):
         output_container.mux(packet)
 
     output_container.close()
-    ogg_bytes = buf.getvalue()
+    aac_bytes = buf.getvalue()
 
     duration_sec = len(audio_chunk) / SAMPLE_RATE
-    size_mb = len(ogg_bytes) / (1024 * 1024)
+    size_mb = len(aac_bytes) / (1024 * 1024)
     print(f"Transcribing chunk: {duration_sec:.1f}s, {size_mb:.2f}MB")
 
     prompt_text = "Please transcribe the following audio clip."
@@ -58,8 +59,8 @@ def process_audio_chunk(audio_chunk):
             contents=[
                 prompt_text,
                 types.Part.from_bytes(
-                    data=ogg_bytes,
-                    mime_type="audio/ogg",
+                    data=aac_bytes,
+                    mime_type="audio/aac",
                 )
             ]
         )
