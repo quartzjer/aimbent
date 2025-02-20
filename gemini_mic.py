@@ -3,7 +3,7 @@ import sys
 import io
 import numpy as np
 import sounddevice as sd
-import av
+import soundfile as sf  # New dependency for OGG/Vorbis encoding
 from silero_vad import load_silero_vad, get_speech_timestamps
 from dotenv import load_dotenv
 from google import genai
@@ -27,29 +27,18 @@ client = genai.Client(api_key=API_KEY)
 
 def process_audio_chunk(audio_chunk):
     """
-    Encode the given audio chunk as AAC and send it to Gemini for transcription.
-    `audio_chunk` here is assumed to be int16 NumPy array.
+    Encode the given audio chunk as OGG (using Vorbis via PySoundFile) and send it to Gemini for transcription.
+    `audio_chunk` is expected to be an int16 NumPy array.
     """
-    # Convert the NumPy int16 array to AAC using PyAV
     buf = io.BytesIO()
-    output_container = av.open(buf, mode='w', format='ipod')
-    stream = output_container.add_stream('aac', rate=SAMPLE_RATE)
-    stream.options = {'profile': 'aac_low'}
-
-    # Create a mono audio frame. If audio_chunk is shape (N,), reshape to (1, N) for PyAV.
-    frame = av.AudioFrame.from_ndarray(audio_chunk.reshape(1, -1), format='s16', layout='mono')
-    frame.sample_rate = SAMPLE_RATE
-
-    for packet in stream.encode(frame):
-        output_container.mux(packet)
-    for packet in stream.encode():
-        output_container.mux(packet)
-
-    output_container.close()
-    aac_bytes = buf.getvalue()
+    # PySoundFile expects data in shape (samples, channels). Reshape for mono.
+    audio_data = audio_chunk.reshape(-1, CHANNELS)
+    # Write the OGG/Vorbis file into the BytesIO buffer.
+    sf.write(buf, audio_data, SAMPLE_RATE, format='OGG', subtype='VORBIS')
+    ogg_bytes = buf.getvalue()
 
     duration_sec = len(audio_chunk) / SAMPLE_RATE
-    size_mb = len(aac_bytes) / (1024 * 1024)
+    size_mb = len(ogg_bytes) / (1024 * 1024)
     print(f"Transcribing chunk: {duration_sec:.1f}s, {size_mb:.2f}MB")
 
     prompt_text = "Please transcribe the following audio clip."
@@ -59,8 +48,8 @@ def process_audio_chunk(audio_chunk):
             contents=[
                 prompt_text,
                 types.Part.from_bytes(
-                    data=aac_bytes,
-                    mime_type="audio/aac",
+                    data=ogg_bytes,
+                    mime_type="audio/ogg",
                 )
             ]
         )
@@ -82,26 +71,19 @@ def audio_callback(indata, frames, time, status):
     if status:
         print(status, file=sys.stderr)
 
-    # indata is shape (frames, CHANNELS). For mono, we can reduce to (frames,)
-    # If multi-channel, adapt accordingly (just be consistent).
+    # indata is shape (frames, CHANNELS). For mono, reduce to (frames,)
     new_audio = indata[:, 0]
-
-    # Append to the global buffer
     global_buffer = np.concatenate((global_buffer, new_audio))
     global_new_audio_count += len(new_audio)
 
-    # Wait until CHUNK_DURATION seconds of new audio have accumulated
     if global_new_audio_count < CHUNK_DURATION * SAMPLE_RATE:
         return
 
-    # Reset counter after threshold is met, ensuring we wait CHUNK_DURATION again.
+    # Reset counter after accumulating CHUNK_DURATION seconds of audio.
     global_new_audio_count = 0
-
-    # We have enough data to do some VAD
     print("Running VAD on buffered audio...")
 
-    # VAD expects float PCM in [-1, 1]
-    # global_buffer is already float32 in [-1, 1], so no need to scale for VAD.
+    # VAD expects float PCM in [-1, 1] (global_buffer is already in that range).
     speech_segments = get_speech_timestamps(
         global_buffer,
         model,
@@ -111,25 +93,23 @@ def audio_callback(indata, frames, time, status):
     print(f"Detected {len(speech_segments)} speech segments.")
 
     if len(speech_segments) < 1:
-        # Empty the buffer
+        # Clear the buffer if no speech is detected.
         global_buffer = global_buffer[0:0]
         return
     elif len(speech_segments) == 1:
-        # Trim off the beginning before the single detected segment.
+        # Retain unprocessed audio starting from the beginning of the only segment.
         trim_sample = int(speech_segments[0]['start'] * SAMPLE_RATE)
         global_buffer = global_buffer[trim_sample:]
         return
     else:
-        # Build chunk from start of first segment to end of second-last segment.
+        # Process from the start of the first segment to the end of the second-last segment.
         chunk_start = int(speech_segments[0]['start'] * SAMPLE_RATE)
         chunk_end = int(speech_segments[-2]['end'] * SAMPLE_RATE)
         chunk = global_buffer[chunk_start:chunk_end]
-
-        # Convert float data to int16 and process the chunk.
+        # Convert float data to int16.
         chunk_int16 = (np.clip(chunk, -1.0, 1.0) * 32767).astype(np.int16)
         process_audio_chunk(chunk_int16)
-
-        # Retain incomplete audio containing the last segment
+        # Retain audio starting from the end of the processed chunk.
         global_buffer = global_buffer[chunk_end:]
 
 try:
