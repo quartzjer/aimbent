@@ -24,8 +24,12 @@ def process_screenshots(interval, output_dir, min_threshold, use_gemini):  # add
     prev_images = {}
 
     while True:
-        cycle_start = time.time()
-        monitor_images = screen_snap()
+        try:
+            monitor_images = screen_snap()
+        except Exception as e:
+            log(f"Error taking screenshot: {e}", force=True)
+            time.sleep(interval)
+            continue
         for idx, pil_img in enumerate(monitor_images, start=1):
             if idx not in prev_images:
                 prev_images[idx] = pil_img
