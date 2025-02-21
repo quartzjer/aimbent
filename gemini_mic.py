@@ -2,7 +2,7 @@ import os
 import sys
 import io
 import numpy as np
-import sounddevice as sd
+import soundcard as sc
 import soundfile as sf
 from silero_vad import load_silero_vad, get_speech_timestamps
 from dotenv import load_dotenv
@@ -12,6 +12,7 @@ import threading
 import datetime
 import json
 from noisereduce import reduce_noise
+import time
 
 load_dotenv()
 API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -120,7 +121,7 @@ def combine_speech_chunks_timer():
     and save the OGG and transcription response to timestamped files.
     """
     while True:
-        sd.sleep(60000)
+        time.sleep(20)
         with speech_segments_lock:
             if not global_speech_segments:
                 continue
@@ -165,42 +166,34 @@ def process_buffer_async(buffer_snapshot):
             global global_buffer
             global_buffer = np.concatenate((unprocessed, global_buffer))
 
-def audio_callback(indata, frames, time, status):
-    """
-    Continuously accumulate audio data into global_buffer.
-    When enough audio is accumulated, offload VAD and transcription processing to a background thread.
-    """
-    global global_buffer, global_new_audio_count
-    if status:
-        print(status, file=sys.stderr)
-
-    # indata is shape (frames, CHANNELS). For mono, reduce to (frames,)
-    new_audio = indata[:, 0]
-    with buffer_lock:
-        global_buffer = np.concatenate((global_buffer, new_audio))
-        global_new_audio_count += len(new_audio)
-        if global_new_audio_count < CHUNK_DURATION * SAMPLE_RATE:
-            return
-        # Take a snapshot and reset the buffer and counter.
-        buffer_snapshot = global_buffer.copy()
-        global_buffer = np.array([], dtype=np.float32)
-        global_new_audio_count = 0
-
-    print("Starting background VAD processing...")
-    threading.Thread(target=process_buffer_async, args=(buffer_snapshot,)).start()
-
-# Start the background timer thread.
-timer_thread = threading.Thread(target=combine_speech_chunks_timer, daemon=True)
-timer_thread.start()
-
-try:
-    with sd.InputStream(channels=CHANNELS, samplerate=SAMPLE_RATE, callback=audio_callback):
-        print("#" * 80)
-        print("Recording... Press Ctrl+C to stop.")
-        print("#" * 80)
+def main():
+    threading.Thread(target=combine_speech_chunks_timer, daemon=True).start()
+    mics = sc.all_microphones()
+    if not mics:
+        sys.exit("No audio input devices found!")
+    mic = mics[0]
+    print(f"Using device 0: {mic.name}")
+    
+    try:
         while True:
-            sd.sleep(1000)
-except KeyboardInterrupt:
-    print("\nRecording stopped (Ctrl+C pressed)")
-except Exception as e:
-    print(f"Error during audio streaming: {e}")
+            # Record CHUNK_DURATION seconds from device 0
+            recording = mic.record(samplerate=SAMPLE_RATE, numframes=CHUNK_DURATION * SAMPLE_RATE, channels=[0])
+            recording = recording.squeeze(axis=1)
+            with buffer_lock:
+                global global_buffer, global_new_audio_count
+                global_buffer = np.concatenate((global_buffer, recording))
+                global_new_audio_count += len(recording)
+                if global_new_audio_count < CHUNK_DURATION * SAMPLE_RATE:
+                    continue  # wait until enough audio is accumulated
+                buffer_snapshot = global_buffer.copy()
+                global_buffer = np.array([], dtype=np.float32)
+                global_new_audio_count = 0
+            print("Starting background VAD processing...")
+            threading.Thread(target=process_buffer_async, args=(buffer_snapshot,)).start()
+    except KeyboardInterrupt:
+        print("\nRecording stopped (Ctrl+C pressed)")
+    except Exception as e:
+        print(f"Error during audio recording: {e}")
+
+if __name__ == "__main__":
+    main()
