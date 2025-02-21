@@ -1,5 +1,17 @@
 import soundcard as sc
 import soundfile as sf
+import threading
+
+def record_device(mic, sample_rate, duration, device_id):
+    # Record audio from a single device and save to 'test_[id].ogg'
+    print(f"\nRecording {duration} seconds using device {device_id}: {mic.name}")
+    try:
+        recording = mic.record(samplerate=sample_rate, numframes=int(duration * sample_rate))
+        filename = f"test_{device_id}.ogg"
+        sf.write(filename, recording, sample_rate)
+        print(f"Recording from device {device_id} saved to {filename}")
+    except Exception as e:
+        print(f"Error recording from device {device_id}: {e}")
 
 def main():
     # List all microphones including loopback (monitor) devices.
@@ -13,30 +25,18 @@ def main():
         # mic.channels is an integer (number of channels)
         print(f"{i}: {mic.name} (channels: {mic.channels})")
     
-    try:
-        device_id = int(input("\nEnter device ID for recording: "))
-        if device_id < 0 or device_id >= len(mics):
-            print(f"Error: Device ID must be between 0 and {len(mics)-1}")
-            return
-        
-        mic = mics[device_id]
-        sample_rate = 44100  # or 48000, depending on your system's settings
-        duration = 5         # seconds
-        
-        print(f"\nRecording {duration} seconds using device: {mic.name}")
-        print("Recording...")
-        
-        # Record audio (numframes = sample_rate * duration)
-        recording = mic.record(samplerate=sample_rate, numframes=int(duration * sample_rate))
-        
-        # Save the recording to a file
-        sf.write('test.ogg', recording, sample_rate)
-        print("Recording saved to test.ogg")
-        
-    except ValueError:
-        print("Error: Please enter a valid integer.")
-    except Exception as e:
-        print(f"Error: {e}")
+    sample_rate = 44100  # or 48000, depending on your system's settings
+    duration = 5         # seconds
+
+    print("\nRecording from all devices in parallel...")
+    threads = []
+    for i, mic in enumerate(mics):
+        thread = threading.Thread(target=record_device, args=(mic, sample_rate, duration, i))
+        thread.start()
+        threads.append(thread)
+
+    for thread in threads:
+        thread.join()
 
 if __name__ == "__main__":
     main()
