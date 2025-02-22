@@ -1,4 +1,9 @@
 from cffi import FFI
+import numpy as np
+
+class WebRTCAudioError(Exception):
+    """Base exception for WebRTC audio processing errors"""
+    pass
 
 class WebRTCAudio:
     def __init__(self):
@@ -121,11 +126,46 @@ class WebRTCAudio:
     def configure_apm(self, apm):
         self.lib.apm_configure(apm)
 
-    def process_frame(self, apm, far_frame, near_frame, out_frame, sample_rate, channels, frame_size):
+    def process_frame(self, apm, far_frame, near_frame, sample_rate=48000, channels=1, frame_size=480):
+        """
+        Process audio frames through WebRTC APM.
+        
+        Args:
+            apm: APM instance
+            far_frame: Far-end (reference) audio as numpy array
+            near_frame: Near-end audio as numpy array
+            sample_rate: Sample rate (default: 48000)
+            channels: Number of channels (default: 1)
+            frame_size: Frame size (default: 480)
+            
+        Returns:
+            numpy.ndarray: Processed audio frame
+            
+        Raises:
+            WebRTCAudioError: If processing fails
+        """
+        if not isinstance(far_frame, np.ndarray) or not isinstance(near_frame, np.ndarray):
+            raise TypeError("Audio frames must be numpy arrays")
+            
+        out_frame = np.zeros(frame_size, dtype=np.float32)
+        
         far_buf = self.ffi.from_buffer("float[]", far_frame)
         near_buf = self.ffi.from_buffer("float[]", near_frame)
         out_buf = self.ffi.from_buffer("float[]", out_frame)
-        return self.lib.apm_process(apm, far_buf, near_buf, out_buf, sample_rate, channels, frame_size)
+        
+        result = self.lib.apm_process(apm, far_buf, near_buf, out_buf, 
+                                    sample_rate, channels, frame_size)
+        
+        if result != 0:
+            error_messages = {
+                -1: "Invalid parameters",
+                -2: "Processing exception",
+                -3: "Invalid sample rate/channels/frame size configuration",
+                -4: "Error processing far-end stream"
+            }
+            raise WebRTCAudioError(error_messages.get(result, f"Unknown error: {result}"))
+            
+        return out_frame
 
     def destroy_apm(self, apm):
         self.lib.apm_destroy(apm)
