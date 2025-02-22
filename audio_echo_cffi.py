@@ -1,6 +1,8 @@
 import soundcard as sc
 import numpy as np
-from webrtc_audio import WebRTCAudio
+import soundfile as sf
+from webrtc_audio import WebRTCAudio, WebRTCAudioError
+import threading  # new import
 
 # Initialize the WebRTC AudioProcessing module
 audio = WebRTCAudio()
@@ -15,72 +17,79 @@ print("APM configured")
 
 # Open the two audio sources
 print("Setting up audio devices...")
-mics = sc.all_microphones()
+mics = sc.all_microphones(include_loopback=True)
 if len(mics) < 2:
     raise RuntimeError("Need at least two microphones for echo cancellation")
 far_mic = mics[1]
 near_mic = mics[0]
 SAMPLE_RATE = 48000
 FRAME_SIZE = 480  # Exactly 10ms at 48kHz
+NUM_FRAMES = int((SAMPLE_RATE * 5) / FRAME_SIZE)
 channels = 1  # We'll convert stereo to mono
 
 print(f"Using far-end reference mic: {far_mic.name}")
 print(f"Using near-end mic: {near_mic.name}")
 
+far_frames = []
+near_frames = []
+
+def record_far():
+    with far_mic.recorder(samplerate=SAMPLE_RATE, channels=2) as far_rec:
+        # Record 5 seconds in one go
+        far_data = far_rec.record(numframes=SAMPLE_RATE * 5)
+        far_frames.append(far_data)
+        print("Far mic: recorded 5 seconds")
+
+def record_near():
+    with near_mic.recorder(samplerate=SAMPLE_RATE, channels=2) as near_rec:
+        # Record 5 seconds in one go
+        near_data = near_rec.record(numframes=SAMPLE_RATE * 5)
+        near_frames.append(near_data)
+        print("Near mic: recorded 5 seconds")
+
 try:
-    print("Opening audio streams...")
-    with far_mic.recorder(samplerate=SAMPLE_RATE, channels=2) as far_rec, \
-         near_mic.recorder(samplerate=SAMPLE_RATE, channels=2) as near_rec:
-        
-        # Add debugging for initial frame capture
-        print("Testing initial frame capture...")
-        far_test = far_rec.record(numframes=FRAME_SIZE)
-        near_test = near_rec.record(numframes=FRAME_SIZE)
-        print(f"Initial far frame shape: {far_test.shape}, dtype: {far_test.dtype}")
-        print(f"Initial near frame shape: {near_test.shape}, dtype: {near_test.dtype}")
-        
-        print("Starting processing loop...")
-        NUM_FRAMES = 10  # Start with fewer frames for testing
-        for i in range(NUM_FRAMES):
-            print(f"\nProcessing frame {i}...")
-            
-            # Debug frame capture
-            far_frame = far_rec.record(numframes=FRAME_SIZE)
-            near_frame = near_rec.record(numframes=FRAME_SIZE)
-            print(f"Captured frame shapes - far: {far_frame.shape}, near: {near_frame.shape}")
-            
-            # Debug mono conversion
-            far_mono = np.ascontiguousarray(far_frame[:, 0], dtype=np.float32)
-            near_mono = np.ascontiguousarray(near_frame[:, 0], dtype=np.float32)
-            out_buf = np.zeros(FRAME_SIZE, dtype=np.float32)
-            print(f"Mono arrays - far: {far_mono.shape}, near: {near_mono.shape}")
-            
-            # Keep arrays alive during processing
-            arrays = [far_mono, near_mono, out_buf]
-            
-            # Debug array properties
-            print(f"far_mono contiguous: {far_mono.flags['C_CONTIGUOUS']}")
-            print(f"near_mono contiguous: {near_mono.flags['C_CONTIGUOUS']}")
-            print(f"Data ranges - far: [{far_mono.min():.3f}, {far_mono.max():.3f}], "
-                  f"near: [{near_mono.min():.3f}, {near_mono.max():.3f}]")
-            
-            # Debug processing
-            print("Calling process_frame through WebRTCAudio API...")
-            err = audio.process_frame(apm, far_mono, near_mono, out_buf,
-                                      SAMPLE_RATE, channels, FRAME_SIZE)
-            if err != 0:
-                error_messages = {
-                    -1: "Invalid parameters",
-                    -2: "Processing exception",
-                    -3: "Invalid sample rate",
-                    -4: "Invalid channel count",
-                    -5: "Invalid frame size"
-                }
-                print(f"Error: {error_messages.get(err, 'Unknown error')} (code: {err})")
-                continue
-            
-            print(f"Output range: [{out_buf.min():.3f}, {out_buf.max():.3f}]")
-            
+    print("Starting concurrent audio capture threads...")
+    t_far = threading.Thread(target=record_far)
+    t_near = threading.Thread(target=record_near)
+    t_far.start()
+    t_near.start()
+    t_far.join()
+    t_near.join()
+    print("Finished recording. Starting processing...")
+
+    far_data = far_frames[0]
+    near_data = near_frames[0]
+    # Save raw recordings
+    print("Saving raw audio recordings...")
+    sf.write('test_far.ogg', far_data, SAMPLE_RATE)
+    sf.write('test_near.ogg', near_data, SAMPLE_RATE)
+
+    # Split the full recordings into chunks of FRAME_SIZE samples
+    processed_frames = []
+    far_data = far_frames[0]
+    near_data = near_frames[0]
+    num_chunks = len(far_data) // FRAME_SIZE
+
+    for i in range(num_chunks):
+        start = i * FRAME_SIZE
+        end = start + FRAME_SIZE
+        far_chunk = np.ascontiguousarray(far_data[start:end, 0], dtype=np.float32)
+        near_chunk = np.ascontiguousarray(near_data[start:end, 0], dtype=np.float32)
+        try:
+            processed_audio = audio.process_frame(apm, far_chunk, near_chunk)
+            processed_frames.append(processed_audio)
+            if i % 50 == 0:
+                print(f"Processing: chunk {i}/{num_chunks}, range: [{processed_audio.min():.3f}, {processed_audio.max():.3f}]")
+        except WebRTCAudioError as e:
+            print(f"Chunk {i} processing error: {e}")
+            continue
+
+    print("Processing complete!")
+    print("Saving processed audio to test_aec.ogg...")
+    final_audio = np.concatenate(processed_frames)
+    sf.write('test_aec.ogg', final_audio, SAMPLE_RATE)
+    print("Audio saved successfully!")
+
 except Exception as e:
     print(f"Error during processing: {str(e)}")
     raise
