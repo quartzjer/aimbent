@@ -17,21 +17,31 @@ def main():
     # List all microphones including loopback (monitor) devices.
     mics = sc.all_microphones(include_loopback=True)
     if not mics:
-        print("No audio input devices found!")
+        print("No audio devices found!")
         return
 
-    print("Available audio input devices (including loopback devices):")
+    print("Available audio devices:")
     for i, mic in enumerate(mics):
-        # mic.channels is an integer (number of channels)
-        print(f"{i}: {mic.name} (channels: {mic.channels})")
+        print(f"{i}: {mic.name}")
     
-    sample_rate = 44100  # or 48000, depending on your system's settings
-    duration = 5         # seconds
+    # Get user input for device selection
+    while True:
+        try:
+            selection = input("\nEnter device IDs to record from (comma-separated): ").strip()
+            device_ids = [int(x.strip()) for x in selection.split(',')]
+            if not all(0 <= id < len(mics) for id in device_ids):
+                raise ValueError("Invalid device ID")
+            break
+        except ValueError:
+            print(f"Please enter valid device IDs between 0 and {len(mics)-1}")
+    
+    sample_rate = 44100
+    duration = 5
 
-    print("\nRecording from all devices in parallel...")
+    print("\nRecording from selected devices in parallel...")
     threads = []
-    for i, mic in enumerate(mics):
-        thread = threading.Thread(target=record_device, args=(mic, sample_rate, duration, i))
+    for device_id in device_ids:
+        thread = threading.Thread(target=record_device, args=(mics[device_id], sample_rate, duration, device_id))
         thread.start()
         threads.append(thread)
 
