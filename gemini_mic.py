@@ -13,6 +13,7 @@ import datetime
 import json
 from noisereduce import reduce_noise
 import time
+from queue import Queue
 
 load_dotenv()
 API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -36,28 +37,30 @@ class AudioDevice:
         self.device = device
         self.label = label
         self.buffer = np.array([], dtype=np.float32)
-        self.lock = threading.Lock()
         self.timestamp = None
+        self.queue = Queue()
+        self.is_suppressed = False
+        self.last_active_time = None
 
-    def append_audio(self, audio_data):
-        with self.lock:
-            if self.timestamp is None:
-                self.timestamp = datetime.datetime.now()
-            self.buffer = np.concatenate((self.buffer, audio_data))
+    def queue_chunk(self, audio_data, timestamp):
+        self.queue.put((audio_data, timestamp))
+
+    def append_audio(self, audio_data, timestamp=None):
+        if self.timestamp is None:
+            self.timestamp = timestamp or datetime.datetime.now()
+        self.buffer = np.concatenate((self.buffer, audio_data))
 
     def prepend_audio(self, audio_data, timestamp):
-        with self.lock:
-            self.buffer = np.concatenate((audio_data, self.buffer)) if self.buffer.size > 0 else audio_data
-            self.timestamp = timestamp
+        self.buffer = np.concatenate((audio_data, self.buffer)) if self.buffer.size > 0 else audio_data
+        self.timestamp = timestamp
 
     def get_and_clear_buffer(self):
-        with self.lock:
-            if self.buffer.size == 0 or self.timestamp is None:
-                return None
-            snapshot = (self.buffer.copy(), self.timestamp)
-            self.buffer = np.array([], dtype=np.float32)
-            self.timestamp = None
-            return snapshot
+        if self.buffer.size == 0 or self.timestamp is None:
+            return None
+        snapshot = (self.buffer.copy(), self.timestamp)
+        self.buffer = np.array([], dtype=np.float32)
+        self.timestamp = None
+        return snapshot
 
 class AudioRecorder:
     def __init__(self, save_dir=None):
@@ -72,6 +75,9 @@ class AudioRecorder:
         mics = sc.all_microphones(include_loopback=True)
         if len(mics) < 2:
             raise RuntimeError("At least 2 audio input devices are required!")
+        print("Using devices:")
+        print(f"Microphone: {mics[0].name}")
+        print(f"System audio: {mics[1].name}")
         return {
             'mic': AudioDevice(mics[0], "microphone"),
             'sys': AudioDevice(mics[1], "system")
@@ -81,7 +87,6 @@ class AudioRecorder:
         device = self.devices[device_key]
         while self._running:
             try:
-                # Wait for both threads to be ready before recording so chunks are synchronized
                 self.record_barrier.wait(timeout=5)
                 
                 recording = device.device.record(
@@ -89,10 +94,11 @@ class AudioRecorder:
                     numframes=CHUNK_DURATION * SAMPLE_RATE,
                     channels=[0]
                 )
-                device.append_audio(recording.squeeze(axis=1))
-                print(f"Recorded {CHUNK_DURATION} seconds from {device.device.name}")
+                # Queue the recorded chunk
+                device.queue_chunk(recording.squeeze(axis=1), datetime.datetime.now())
+                print(f"Queued {CHUNK_DURATION} seconds from {device.device.name}")
             except threading.BrokenBarrierError:
-                if self._running:  # Only log if it wasn't intentional shutdown
+                if self._running:
                     print(f"Synchronization broken for {device.label}")
                 break
             except Exception as e:
@@ -162,8 +168,8 @@ class AudioRecorder:
     def combine_speech_chunks_timer(self):
         while self._running:
             time.sleep(20)
-            segments_all = []
             
+            segments_all = []
             for device_key, device in self.devices.items():
                 segments = self.process_buffer(device)
                 segments_all.extend(segments)
