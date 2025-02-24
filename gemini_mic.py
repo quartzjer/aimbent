@@ -66,6 +66,7 @@ class AudioRecorder:
         self.client = genai.Client(api_key=API_KEY)
         self.devices = self._initialize_devices()
         self._running = True
+        self.record_barrier = threading.Barrier(2)
 
     def _initialize_devices(self):
         mics = sc.all_microphones(include_loopback=True)
@@ -79,13 +80,26 @@ class AudioRecorder:
     def record_device(self, device_key):
         device = self.devices[device_key]
         while self._running:
-            recording = device.device.record(
-                samplerate=SAMPLE_RATE,
-                numframes=CHUNK_DURATION * SAMPLE_RATE,
-                channels=[0]
-            )
-            device.append_audio(recording.squeeze(axis=1))
-            print(f"Recorded {CHUNK_DURATION} seconds from {device.device.name}")
+            try:
+                # Wait for both threads to be ready before recording so chunks are synchronized
+                self.record_barrier.wait(timeout=5)
+                
+                recording = device.device.record(
+                    samplerate=SAMPLE_RATE,
+                    numframes=CHUNK_DURATION * SAMPLE_RATE,
+                    channels=[0]
+                )
+                device.append_audio(recording.squeeze(axis=1))
+                print(f"Recorded {CHUNK_DURATION} seconds from {device.device.name}")
+            except threading.BrokenBarrierError:
+                if self._running:  # Only log if it wasn't intentional shutdown
+                    print(f"Synchronization broken for {device.label}")
+                break
+            except Exception as e:
+                print(f"Error recording from {device.label}: {e}")
+                if self._running:
+                    self.record_barrier.reset()
+                break
 
     def process_buffer(self, device):
         snapshot = device.get_and_clear_buffer()
@@ -197,6 +211,7 @@ class AudioRecorder:
                 time.sleep(1)
         except KeyboardInterrupt:
             self._running = False
+            self.record_barrier.reset()  # Break the barrier to allow threads to exit
             print("\nRecording stopped (Ctrl+C pressed)")
         except Exception as e:
             self._running = False
