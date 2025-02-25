@@ -131,7 +131,7 @@ def main():
     for i in range(2):
         print(f"{i}: {mics[i].name}")
 
-    sample_rate = 44100
+    sample_rate = 16000
     duration = 5
 
     # Record both sources in parallel

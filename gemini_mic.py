@@ -32,6 +32,41 @@ CHUNK_DURATION = 5
 SAMPLE_RATE = 16000
 CHANNELS = 1
 
+def rms(frame):
+    """Compute RMS of a 1D numpy array."""
+    return np.sqrt(np.mean(frame**2)) if len(frame) else 0.0
+
+def suppress_mic_echo(mic_chunk, sys_chunk):
+    # Calculate samples per 50ms section
+    samples_per_section = int(0.05 * SAMPLE_RATE)
+    
+    # Ensure chunks are the same length and get number of sections
+    min_length = min(len(mic_chunk), len(sys_chunk))
+    num_sections = min_length // samples_per_section
+    
+    # Create a copy of the mic chunk
+    processed_mic = mic_chunk.copy()
+    
+    # Pre-calculate RMS for all sections
+    mic_rms = [rms(mic_chunk[i*samples_per_section:(i+1)*samples_per_section]) 
+              for i in range(num_sections)]
+    sys_rms = [rms(sys_chunk[i*samples_per_section:(i+1)*samples_per_section]) 
+              for i in range(num_sections)]
+    
+    # Process each section
+    for i in range(num_sections):
+        # Define window (current, up to 4 before, up to 4 after)
+        window_start = max(0, i - 4)
+        window_end = min(num_sections, i + 5)  # +5 because range is exclusive
+        
+        # Check if system RMS > mic RMS for half of the sections in window
+        if sum(sys_rms[j] > mic_rms[j] for j in range(window_start, window_end)) > (window_end - window_start) * 0.5:
+            # Silence the current section
+            start_idx = i * samples_per_section
+            end_idx = (i + 1) * samples_per_section
+            processed_mic[start_idx:end_idx] = 0.0
+    
+    return processed_mic
 class AudioDevice:
     def __init__(self, device, label):
         self.device = device
@@ -120,7 +155,14 @@ class AudioRecorder:
             speech_pad_ms=100,
             min_silence_duration_ms=500
         )
-        
+        buffer_seconds = len(buffer_data) / SAMPLE_RATE
+        print(f"Detected {len(speech_segments)} speech segments in {device.label} of {buffer_seconds:.1f} seconds.")
+        # Debug: Save buffer to file
+        debug_filename = f"test_{device.label}.ogg"
+        debug_data = (np.clip(buffer_data, -1.0, 1.0) * 32767).astype(np.int16)
+        sf.write(debug_filename, debug_data, SAMPLE_RATE, format='OGG', subtype='VORBIS')
+        print(f"Saved debug file: {debug_filename}")
+
         segments = []
         total_duration = len(buffer_data) / SAMPLE_RATE
 
@@ -139,7 +181,7 @@ class AudioRecorder:
         
         return segments
 
-    def process_audio_chunk(self, ogg_bytes):
+    def transcribe(self, ogg_bytes):
         size_mb = len(ogg_bytes) / (1024 * 1024)
         print(f"Transcribing chunk: {size_mb:.2f}MB")
         
@@ -165,12 +207,27 @@ class AudioRecorder:
             print(f"Error during transcription: {e}")
             return ""
 
+    def process_chunks(self):
+        mic_device = self.devices['mic']
+        sys_device = self.devices['sys']
+        
+        # Process chunks from both queues together
+        while not mic_device.queue.empty() and not sys_device.queue.empty():
+            mic_chunk, mic_ts = mic_device.queue.get()
+            sys_chunk, sys_ts = sys_device.queue.get()
+
+            processed_mic = suppress_mic_echo(mic_chunk, sys_chunk)
+
+            mic_device.append_audio(processed_mic, mic_ts)
+            sys_device.append_audio(sys_chunk, sys_ts)
+
     def combine_speech_chunks_timer(self):
         while self._running:
             time.sleep(20)
+            self.process_chunks()
             
             segments_all = []
-            for device_key, device in self.devices.items():
+            for _, device in self.devices.items():
                 segments = self.process_buffer(device)
                 segments_all.extend(segments)
                 print(f"Processed {len(segments)} segments from {device.label}.")
@@ -188,7 +245,7 @@ class AudioRecorder:
             sf.write(buf, audio_data, SAMPLE_RATE, format='OGG', subtype='VORBIS')
             ogg_bytes = buf.getvalue()
             
-            response_text = self.process_audio_chunk(ogg_bytes)
+            response_text = self.transcribe(ogg_bytes)
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             
             self.save_results(timestamp, ogg_bytes, response_text)
