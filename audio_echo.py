@@ -2,41 +2,53 @@ import soundcard as sc
 import soundfile as sf
 import threading
 import numpy as np
-import adaptfilt as adf  # Using adaptfilt for adaptive filtering
+from pyaec import Aec
+import struct
 
 def record_device(device, sample_rate, duration, storage, key):
     # This call blocks until the recording is complete.
     storage[key] = device.record(samplerate=sample_rate, numframes=int(duration * sample_rate))
 
-def process_with_echo_cancellation(mic_audio, monitor_audio, sample_rate):
+def process_with_pyaec(mic_audio, monitor_audio, sample_rate):
     """
-    Apply echo cancellation on mic_audio using monitor_audio as the far-end reference.
-    Assumes mic_audio and monitor_audio are numpy arrays in float32 format (range -1 to 1).
+    Apply echo cancellation on mic_audio using monitor_audio as the far-end reference
+    using PyAEC library.
     
-    This implementation uses the NLMS adaptive filter from adaptfilt:
-      - x: reference (monitor) signal.
-      - d: microphone signal (contains near-end speech plus echo).
-      - The NLMS algorithm estimates the echo component so that the error e = d - y
-        contains the near-end speech with the echo removed.
+    Args:
+        mic_audio: Numpy array containing microphone audio (near-end)
+        monitor_audio: Numpy array containing system audio (far-end)
+        sample_rate: Audio sample rate in Hz
+    
+    Returns:
+        Numpy array containing echo-cancelled audio
     """
-    # Parameters for the NLMS algorithm (tune as necessary)
-    mu = 0.005        # Step size
-    filter_order = 1024  # Number of filter taps (must be an integer)
+    # PyAEC parameters
+    frame_size = 160  # 10ms at 16kHz
+    filter_length = int(sample_rate * 0.1)
     
-    # Flatten signals to ensure they are 1D arrays.
-    x = monitor_audio[:,0].flatten()  # Far-end (reference) signal.
-    d = mic_audio[:,0].flatten()      # Mic signal (with echo).
-
-    # NOTE: The correct call is: nlms(u, d, M, step, ...)
-    # Swap the order: third argument must be filter_order, fourth is mu.
-#    y, e, w = adf.nlms(x, d, filter_order, mu)
-
-    filter_order = 512
-    lam = 0.99  # forgetting factor
-    delta = 0.001
+    # Create echo canceller
+    aec = Aec(frame_size, filter_length, sample_rate, True)
     
-    y, e, w = adf.rls(x, d, filter_order, lam, delta)
-    return e
+    # Convert float32 arrays to int16 (required by PyAEC)
+    mic_int16 = (mic_audio[:,0] * 32767).astype(np.int16)
+    monitor_int16 = (monitor_audio[:,0] * 32767).astype(np.int16)
+    
+    # Process in chunks of frame_size
+    processed_chunks = []
+    for i in range(0, len(mic_int16) - frame_size, frame_size):
+        mic_chunk = mic_int16[i:i+frame_size]
+        monitor_chunk = monitor_int16[i:i+frame_size]
+        
+        # Process with echo canceller
+        processed_chunk = aec.cancel_echo(mic_chunk, monitor_chunk)
+        processed_chunks.append(processed_chunk)
+    
+    # Combine chunks and convert back to float32 range [-1, 1]
+    if processed_chunks:
+        processed = np.concatenate(processed_chunks).astype(np.float32) / 32767.0
+        return processed
+    else:
+        return np.array([])
 
 def main():
     # List devices (including loopback/monitor devices)
@@ -52,7 +64,7 @@ def main():
     print(f"Input microphone: {mic.name}")
     print(f"System monitor: {monitor.name}")
     
-    sample_rate = 44100  # Samples per second
+    sample_rate = 16000  # Use 16kHz as recommended by PyAEC example
     duration = 5         # Duration in seconds
 
     recordings = {}
@@ -78,13 +90,16 @@ def main():
     print("Original recordings saved to test_mic.ogg and test_system.ogg")
 
     # Process the mic audio using the monitor audio as reference.
-    processed = process_with_echo_cancellation(mic_recording, monitor_recording, sample_rate)
+    processed = process_with_pyaec(mic_recording, monitor_recording, sample_rate)
 
-    # Save the processed (echo-cancelled) audio.
-    output_filename = "processed_echo_cancelled.ogg"
-    # Ensure output is two-dimensional (mono)
-    sf.write(output_filename, processed.reshape(-1, 1), sample_rate)
-    print(f"Processed recording saved to {output_filename}")
+    if len(processed) > 0:
+        # Save the processed (echo-cancelled) audio.
+        output_filename = "processed_echo_cancelled.ogg"
+        # Ensure output is two-dimensional (mono)
+        sf.write(output_filename, processed.reshape(-1, 1), sample_rate)
+        print(f"Processed recording saved to {output_filename}")
+    else:
+        print("Error: No processed audio was generated.")
 
 if __name__ == "__main__":
     main()
