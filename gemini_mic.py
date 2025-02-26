@@ -172,8 +172,9 @@ class AudioRecorder:
         segments = []
         total_duration = len(buffer_data) / SAMPLE_RATE
 
-        for seg in speech_segments:
-            if total_duration - seg['end'] < 1:
+        for i, seg in enumerate(speech_segments):
+            # If the last segment is too close to the end the speaking might be continuing
+            if i == len(speech_segments) - 1 and total_duration - seg['end'] < 1:
                 start_idx = int(seg['start'] * SAMPLE_RATE)
                 unprocessed = buffer_data[start_idx:]
                 unproc_ts = base_ts + datetime.timedelta(seconds=seg['start'])
