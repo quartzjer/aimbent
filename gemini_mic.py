@@ -132,7 +132,7 @@ class AudioRecorder:
                 recording = device.device.record(
                     samplerate=SAMPLE_RATE,
                     numframes=CHUNK_DURATION * SAMPLE_RATE,
-                    channels=[0]
+                    channels=[-1]
                 )
                 # Queue the recorded chunk
                 device.queue_chunk(recording.squeeze(axis=1), datetime.datetime.now())
