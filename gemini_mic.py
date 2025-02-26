@@ -14,6 +14,7 @@ import json
 from noisereduce import reduce_noise
 import time
 from queue import Queue
+from pyaec import Aec
 
 load_dotenv()
 API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -32,41 +33,6 @@ CHUNK_DURATION = 5
 SAMPLE_RATE = 16000
 CHANNELS = 1
 
-def rms(frame):
-    """Compute RMS of a 1D numpy array."""
-    return np.sqrt(np.mean(frame**2)) if len(frame) else 0.0
-
-def suppress_mic_echo(mic_chunk, sys_chunk):
-    # Calculate samples per 50ms section
-    samples_per_section = int(0.05 * SAMPLE_RATE)
-    
-    # Ensure chunks are the same length and get number of sections
-    min_length = min(len(mic_chunk), len(sys_chunk))
-    num_sections = min_length // samples_per_section
-    
-    # Create a copy of the mic chunk
-    processed_mic = mic_chunk.copy()
-    
-    # Pre-calculate RMS for all sections
-    mic_rms = [rms(mic_chunk[i*samples_per_section:(i+1)*samples_per_section]) 
-              for i in range(num_sections)]
-    sys_rms = [rms(sys_chunk[i*samples_per_section:(i+1)*samples_per_section]) 
-              for i in range(num_sections)]
-    
-    # Process each section
-    for i in range(num_sections):
-        # Define window (current, up to 4 before, up to 4 after)
-        window_start = max(0, i - 4)
-        window_end = min(num_sections, i + 5)  # +5 because range is exclusive
-        
-        # Check if system RMS > mic RMS for half of the sections in window
-        if sum(sys_rms[j] > mic_rms[j] for j in range(window_start, window_end)) > (window_end - window_start) * 0.5:
-            # Silence the current section
-            start_idx = i * samples_per_section
-            end_idx = (i + 1) * samples_per_section
-            processed_mic[start_idx:end_idx] = 0.0
-    
-    return processed_mic
 class AudioDevice:
     def __init__(self, device, label):
         self.device = device
@@ -148,6 +114,8 @@ class AudioRecorder:
             return []
             
         buffer_data, base_ts = snapshot
+        buffer_data = reduce_noise(y=buffer_data, sr=SAMPLE_RATE)
+        
         speech_segments = get_speech_timestamps(
             buffer_data, self.model,
             sampling_rate=SAMPLE_RATE,
@@ -211,12 +179,35 @@ class AudioRecorder:
         mic_device = self.devices['mic']
         sys_device = self.devices['sys']
         
+        # PyAEC parameters
+        frame_size = int(0.01 * SAMPLE_RATE)
+        filter_length = int(SAMPLE_RATE * 0.1)
+        aec = Aec(frame_size, filter_length, SAMPLE_RATE, True)
+
         # Process chunks from both queues together
         while not mic_device.queue.empty() and not sys_device.queue.empty():
             mic_chunk, mic_ts = mic_device.queue.get()
             sys_chunk, sys_ts = sys_device.queue.get()
 
-            processed_mic = suppress_mic_echo(mic_chunk, sys_chunk)
+            # Convert float32 arrays to int16 (required by PyAEC)
+            mic_int16 = (mic_chunk * 32767).astype(np.int16)
+            sys_int16 = (sys_chunk * 32767).astype(np.int16)
+            
+            # Process in chunks of frame_size
+            processed_chunks = []
+            for i in range(0, len(mic_int16) - frame_size, frame_size):
+                mic_frame = mic_int16[i:i+frame_size]
+                sys_frame = sys_int16[i:i+frame_size]
+                
+                # Process with echo canceller
+                processed_frame = aec.cancel_echo(mic_frame, sys_frame)
+                processed_chunks.append(processed_frame)
+            
+            # Combine chunks and convert back to float32 range [-1, 1]
+            if processed_chunks:
+                processed_mic = np.concatenate(processed_chunks).astype(np.float32) / 32767.0
+            else:
+                processed_mic = mic_chunk
 
             mic_device.append_audio(processed_mic, mic_ts)
             sys_device.append_audio(sys_chunk, sys_ts)
@@ -237,8 +228,7 @@ class AudioRecorder:
 
             segments_all.sort(key=lambda x: x["timestamp"])
             combined = np.concatenate([seg["data"] for seg in segments_all])
-            combined_clean = reduce_noise(y=combined, sr=SAMPLE_RATE)
-            chunk_int16 = (np.clip(combined_clean, -1.0, 1.0) * 32767).astype(np.int16)
+            chunk_int16 = (np.clip(combined, -1.0, 1.0) * 32767).astype(np.int16)
             
             buf = io.BytesIO()
             audio_data = chunk_int16.reshape(-1, CHANNELS)
