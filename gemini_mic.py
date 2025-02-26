@@ -63,6 +63,41 @@ class AudioDevice:
         self.timestamp = None
         return snapshot
 
+class AudioGate:
+    def __init__(self, threshold=0.04, attack_ms=10, release_ms=100, sample_rate=16000, hysteresis_ms=200):
+        self.threshold = threshold
+        self.attack_coef = np.exp(-1.0 / (sample_rate * attack_ms / 1000.0))
+        self.release_coef = np.exp(-1.0 / (sample_rate * release_ms / 1000.0))
+        self.envelope = 0.0
+        self.gain = 0.0
+        self.hysteresis_samples = int(hysteresis_ms * sample_rate / 1000)
+        self.samples_after_threshold = 0
+        self.is_open = False
+
+    def process(self, audio):
+        output = np.zeros_like(audio)
+        for i, sample in enumerate(audio):
+            # Envelope follower
+            level = abs(sample)
+            if level > self.envelope:
+                self.envelope = self.attack_coef * self.envelope + (1.0 - self.attack_coef) * level
+            else:
+                self.envelope = self.release_coef * self.envelope + (1.0 - self.release_coef) * level
+            
+            # Gate logic with hysteresis
+            if self.envelope > self.threshold:
+                self.is_open = True
+                self.samples_after_threshold = 0
+            elif self.is_open:
+                self.samples_after_threshold += 1
+                if self.samples_after_threshold >= self.hysteresis_samples:
+                    self.is_open = False
+            
+            self.gain = 1.0 if self.is_open else 0.0
+            output[i] = sample * self.gain
+            
+        return output
+
 class AudioRecorder:
     def __init__(self, save_dir=None):
         self.save_dir = save_dir or os.getcwd()
@@ -71,6 +106,7 @@ class AudioRecorder:
         self.devices = self._initialize_devices()
         self._running = True
         self.record_barrier = threading.Barrier(2)
+        self.gate = AudioGate(threshold=0.015, attack_ms=10, release_ms=100, sample_rate=SAMPLE_RATE, hysteresis_ms=200)
 
     def _initialize_devices(self):
         mics = sc.all_microphones(include_loopback=True)
@@ -88,7 +124,10 @@ class AudioRecorder:
         device = self.devices[device_key]
         while self._running:
             try:
+                wait_start = time.time()
                 self.record_barrier.wait(timeout=5)
+                wait_duration = time.time() - wait_start
+                print(f"{device.label} waited {wait_duration:.4f} seconds at barrier")
                 
                 recording = device.device.record(
                     samplerate=SAMPLE_RATE,
@@ -114,14 +153,13 @@ class AudioRecorder:
             return []
             
         buffer_data, base_ts = snapshot
-        buffer_data = reduce_noise(y=buffer_data, sr=SAMPLE_RATE)
         
         speech_segments = get_speech_timestamps(
             buffer_data, self.model,
             sampling_rate=SAMPLE_RATE,
             return_seconds=True,
-            speech_pad_ms=100,
-            min_silence_duration_ms=500
+            speech_pad_ms=50,
+            min_silence_duration_ms=200
         )
         buffer_seconds = len(buffer_data) / SAMPLE_RATE
         print(f"Detected {len(speech_segments)} speech segments in {device.label} of {buffer_seconds:.1f} seconds.")
@@ -140,6 +178,7 @@ class AudioRecorder:
                 unprocessed = buffer_data[start_idx:]
                 unproc_ts = base_ts + datetime.timedelta(seconds=seg['start'])
                 device.prepend_audio(unprocessed, unproc_ts)
+                print(f"Unprocessed segment at end of {device.label} buffer of length {len(unprocessed)/SAMPLE_RATE:.1f} seconds.")
                 break
             start_idx = int(seg['start'] * SAMPLE_RATE)
             end_idx = int(seg['end'] * SAMPLE_RATE)
@@ -180,14 +219,20 @@ class AudioRecorder:
         sys_device = self.devices['sys']
         
         # PyAEC parameters
-        frame_size = int(0.01 * SAMPLE_RATE)
-        filter_length = int(SAMPLE_RATE * 0.1)
+        frame_size = int(0.02 * SAMPLE_RATE)
+        filter_length = int(SAMPLE_RATE * 0.2)
         aec = Aec(frame_size, filter_length, SAMPLE_RATE, True)
+
+        # Buffer to collect original microphone audio
+        unprocessed_mic_buffer = np.array([], dtype=np.float32)
 
         # Process chunks from both queues together
         while not mic_device.queue.empty() and not sys_device.queue.empty():
             mic_chunk, mic_ts = mic_device.queue.get()
             sys_chunk, sys_ts = sys_device.queue.get()
+            
+            # Add the original microphone chunk to our buffer
+            unprocessed_mic_buffer = np.concatenate((unprocessed_mic_buffer, mic_chunk))
 
             # Convert float32 arrays to int16 (required by PyAEC)
             mic_int16 = (mic_chunk * 32767).astype(np.int16)
@@ -204,13 +249,20 @@ class AudioRecorder:
                 processed_chunks.append(processed_frame)
             
             # Combine chunks and convert back to float32 range [-1, 1]
-            if processed_chunks:
-                processed_mic = np.concatenate(processed_chunks).astype(np.float32) / 32767.0
-            else:
-                processed_mic = mic_chunk
+            processed_mic = np.concatenate(processed_chunks).astype(np.float32) / 32767.0
+
+            # Noise reduce and apply audio gate to mic after echo cancellation
+            processed_mic = reduce_noise(y=processed_mic, sr=SAMPLE_RATE)
+            processed_mic = self.gate.process(processed_mic)
 
             mic_device.append_audio(processed_mic, mic_ts)
             sys_device.append_audio(sys_chunk, sys_ts)
+        
+        # Save all collected original microphone audio to a file
+        if unprocessed_mic_buffer.size > 0:
+            orig_mic_int16 = (np.clip(unprocessed_mic_buffer, -1.0, 1.0) * 32767).astype(np.int16)
+            sf.write("test_orig.ogg", orig_mic_int16, SAMPLE_RATE, format='OGG', subtype='VORBIS')
+            print(f"Saved original microphone audio to test_orig.ogg ({len(orig_mic_int16)/SAMPLE_RATE:.2f} seconds)")
 
     def combine_speech_chunks_timer(self):
         while self._running:

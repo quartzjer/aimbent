@@ -23,8 +23,8 @@ def process_with_pyaec(mic_audio, monitor_audio, sample_rate):
         Numpy array containing echo-cancelled audio
     """
     # PyAEC parameters
-    frame_size = 160  # 10ms at 16kHz
-    filter_length = int(sample_rate * 0.1)
+    frame_size = int(0.02 * sample_rate)
+    filter_length = int(sample_rate * 0.2)
     
     # Create echo canceller
     aec = Aec(frame_size, filter_length, sample_rate, True)

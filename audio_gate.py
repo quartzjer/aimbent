@@ -104,11 +104,11 @@ def visualize_threshold(audio_data, threshold):
 if __name__ == "__main__":
     # Example usage
     duration = 5.0  # seconds
-    threshold = detect_echo_threshold(duration=duration, sample_rate=16000, percentile=98, use_test_tones=False)
+    sample_rate = 16000
+    threshold = detect_echo_threshold(duration=duration, sample_rate=sample_rate, percentile=98, use_test_tones=False)
     print(f"Recommended gate threshold: {threshold:.6f}")
     
     # Record user speech for visualization
-    sample_rate = 44100
     input("Press Enter and start speaking to record a 5-second sample for visualization...")
     print("Recording your speech for visualization...")
     audio = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype='float32')
