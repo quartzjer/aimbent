@@ -38,29 +38,24 @@ class AudioDevice:
         self.device = device
         self.label = label
         self.buffer = np.array([], dtype=np.float32)
-        self.timestamp = None
         self.queue = Queue()
         self.is_suppressed = False
         self.last_active_time = None
 
-    def queue_chunk(self, audio_data, timestamp):
-        self.queue.put((audio_data, timestamp))
+    def queue_chunk(self, audio_data):
+        self.queue.put(audio_data)
 
-    def append_audio(self, audio_data, timestamp=None):
-        if self.timestamp is None:
-            self.timestamp = timestamp or datetime.datetime.now()
+    def append_audio(self, audio_data):
         self.buffer = np.concatenate((self.buffer, audio_data))
 
-    def prepend_audio(self, audio_data, timestamp):
+    def prepend_audio(self, audio_data):
         self.buffer = np.concatenate((audio_data, self.buffer)) if self.buffer.size > 0 else audio_data
-        self.timestamp = timestamp
 
     def get_and_clear_buffer(self):
-        if self.buffer.size == 0 or self.timestamp is None:
+        if self.buffer.size == 0:
             return None
-        snapshot = (self.buffer.copy(), self.timestamp)
+        snapshot = self.buffer.copy()
         self.buffer = np.array([], dtype=np.float32)
-        self.timestamp = None
         return snapshot
 
 class AudioGate:
@@ -105,7 +100,6 @@ class AudioRecorder:
         self.client = genai.Client(api_key=API_KEY)
         self.devices = self._initialize_devices()
         self._running = True
-        self.record_barrier = threading.Barrier(2)
         self.gate = AudioGate(threshold=0.015, attack_ms=10, release_ms=100, sample_rate=SAMPLE_RATE, hysteresis_ms=200)
 
     def _initialize_devices(self):
@@ -120,40 +114,35 @@ class AudioRecorder:
             'sys': AudioDevice(mics[1], "system")
         }
 
-    def record_device(self, device_key):
+    def record_from_device(self, device_key):
+        """Record from a specific device using non-blocking pattern."""
         device = self.devices[device_key]
-        while self._running:
-            try:
-                wait_start = time.time()
-                self.record_barrier.wait(timeout=5)
-                wait_duration = time.time() - wait_start
-                print(f"{device.label} waited {wait_duration:.4f} seconds at barrier")
-                
-                recording = device.device.record(
-                    samplerate=SAMPLE_RATE,
-                    numframes=CHUNK_DURATION * SAMPLE_RATE,
-                    channels=[-1]
-                )
-                # Queue the recorded chunk
-                device.queue_chunk(recording.squeeze(axis=1), datetime.datetime.now())
-                print(f"Queued {CHUNK_DURATION} seconds from {device.device.name}")
-            except threading.BrokenBarrierError:
-                if self._running:
-                    print(f"Synchronization broken for {device.label}")
-                break
-            except Exception as e:
-                print(f"Error recording from {device.label}: {e}")
-                if self._running:
-                    self.record_barrier.reset()
-                break
+        print(f"Starting recording thread for {device.label}: {device.device.name}")
+        
+        try:
+            with device.device.recorder(samplerate=SAMPLE_RATE, channels=[-1]) as recorder:
+                while self._running:
+                    try:
+                        recording = recorder.record(numframes=None)
+                        
+                        if recording is not None and recording.size > 0:
+                            device.queue_chunk(recording)
+                            #print(f"Queued {len(recording) / SAMPLE_RATE:.4f} seconds from {device.label}")
+                    except Exception as e:
+                        print(f"Error recording from {device.label}: {e}")
+                        if not self._running:
+                            break
+                        time.sleep(0.5)
+        except Exception as e:
+            print(f"Error setting up recorder for {device.label}: {e}")
+            if self._running:  # Only log if not due to shutdown
+                print(f"Recording thread for {device.label} crashed: {e}")
 
     def process_buffer(self, device):
-        snapshot = device.get_and_clear_buffer()
-        if not snapshot:
+        buffer_data = device.get_and_clear_buffer()
+        if buffer_data is None:
             return []
             
-        buffer_data, base_ts = snapshot
-        
         speech_segments = get_speech_timestamps(
             buffer_data, self.model,
             sampling_rate=SAMPLE_RATE,
@@ -177,15 +166,16 @@ class AudioRecorder:
             if i == len(speech_segments) - 1 and total_duration - seg['end'] < 1:
                 start_idx = int(seg['start'] * SAMPLE_RATE)
                 unprocessed = buffer_data[start_idx:]
-                unproc_ts = base_ts + datetime.timedelta(seconds=seg['start'])
-                device.prepend_audio(unprocessed, unproc_ts)
+                device.prepend_audio(unprocessed)
                 print(f"Unprocessed segment at end of {device.label} buffer of length {len(unprocessed)/SAMPLE_RATE:.1f} seconds.")
                 break
             start_idx = int(seg['start'] * SAMPLE_RATE)
             end_idx = int(seg['end'] * SAMPLE_RATE)
             seg_data = buffer_data[start_idx:end_idx]
-            seg_abs_ts = base_ts + datetime.timedelta(seconds=seg['start'])
-            segments.append({"timestamp": seg_abs_ts, "data": seg_data})
+            segments.append({
+                "offset": seg['start'],  # Store offset in seconds from buffer start
+                "data": seg_data
+            })
         
         return segments
 
@@ -224,46 +214,67 @@ class AudioRecorder:
         filter_length = int(SAMPLE_RATE * 0.2)
         aec = Aec(frame_size, filter_length, SAMPLE_RATE, True)
 
-        # Buffer to collect original microphone audio
-        unprocessed_mic_buffer = np.array([], dtype=np.float32)
+        # Empty both queues completely into full buffers
+        mic_buffer = np.array([], dtype=np.float32)
+        sys_buffer = np.array([], dtype=np.float32)
+        
+        # Collect all audio from system queue
+        while not sys_device.queue.empty():
+            chunk = sys_device.queue.get()
+            sys_buffer = np.concatenate((sys_buffer, chunk.squeeze(axis=1)))
 
-        # Process chunks from both queues together
-        while not mic_device.queue.empty() and not sys_device.queue.empty():
-            mic_chunk, mic_ts = mic_device.queue.get()
-            sys_chunk, sys_ts = sys_device.queue.get()
-            
-            # Add the original microphone chunk to our buffer
-            unprocessed_mic_buffer = np.concatenate((unprocessed_mic_buffer, mic_chunk))
+        # Collect all audio from mic queue
+        while not mic_device.queue.empty():
+            chunk = mic_device.queue.get()
+            mic_buffer = np.concatenate((mic_buffer, chunk.squeeze(axis=1)))
+        
+        # Make sure both buffers have the same length
+        min_length = min(len(mic_buffer), len(sys_buffer))
+        if min_length == 0:
+            return  # No data to process
 
-            # Convert float32 arrays to int16 (required by PyAEC)
-            mic_int16 = (mic_chunk * 32767).astype(np.int16)
-            sys_int16 = (sys_chunk * 32767).astype(np.int16)
+        print(f"mic seconds {len(mic_buffer)/SAMPLE_RATE:.4f} sys seconds {len(sys_buffer)/SAMPLE_RATE:.4f}")        
+
+        # Save original microphone audio to a file
+        if mic_buffer.size > 0:
+            orig_mic_int16 = (np.clip(mic_buffer, -1.0, 1.0) * 32767).astype(np.int16)
+            sf.write("test_orig.ogg", orig_mic_int16, SAMPLE_RATE, format='OGG', subtype='VORBIS')
+            print(f"Saved original microphone audio to test_orig.ogg ({len(orig_mic_int16)/SAMPLE_RATE:.2f} seconds)")
+
+        # Convert float32 arrays to int16 (required by PyAEC)
+        mic_int16 = (mic_buffer * 32767).astype(np.int16)
+        sys_int16 = (sys_buffer * 32767).astype(np.int16)
+        min_length = min(len(mic_int16), len(sys_int16))
+
+        # Process in chunks of frame_size
+        processed_chunks = []
+
+        # Process complete frames
+        for i in range(0, min_length, frame_size):
+            # Get the frame (could be partial at the end)
+            mic_frame = mic_int16[i:i+frame_size]
+            sys_frame = sys_int16[i:i+frame_size]
             
-            # Process in chunks of frame_size
-            processed_chunks = []
-            for i in range(0, len(mic_int16) - frame_size, frame_size):
-                mic_frame = mic_int16[i:i+frame_size]
-                sys_frame = sys_int16[i:i+frame_size]
-                
+            # If we have a partial frame at the end
+            if min(len(mic_frame), len(sys_frame)) < frame_size:
+                # Just append the raw partial frame
+                processed_chunks.append(mic_frame)
+            else:
                 # Process with echo canceller
                 processed_frame = aec.cancel_echo(mic_frame, sys_frame)
                 processed_chunks.append(processed_frame)
-            
-            # Combine chunks and convert back to float32 range [-1, 1]
-            processed_mic = np.concatenate(processed_chunks).astype(np.float32) / 32767.0
 
-            # Noise reduce and apply audio gate to mic after echo cancellation
-            processed_mic = reduce_noise(y=processed_mic, sr=SAMPLE_RATE)
-            processed_mic = self.gate.process(processed_mic)
+        processed_mic = np.concatenate(processed_chunks).astype(np.float32) / 32767.0
 
-            mic_device.append_audio(processed_mic, mic_ts)
-            sys_device.append_audio(sys_chunk, sys_ts)
+        # Noise reduce and apply audio gate to mic after echo cancellation
+        processed_mic = reduce_noise(y=processed_mic, sr=SAMPLE_RATE)
+        processed_mic = self.gate.process(processed_mic)
+
+        # Append processed audio to device buffers
+        mic_device.append_audio(processed_mic)
+        sys_device.append_audio(sys_buffer)
         
-        # Save all collected original microphone audio to a file
-        if unprocessed_mic_buffer.size > 0:
-            orig_mic_int16 = (np.clip(unprocessed_mic_buffer, -1.0, 1.0) * 32767).astype(np.int16)
-            sf.write("test_orig.ogg", orig_mic_int16, SAMPLE_RATE, format='OGG', subtype='VORBIS')
-            print(f"Saved original microphone audio to test_orig.ogg ({len(orig_mic_int16)/SAMPLE_RATE:.2f} seconds)")
+        print(f"Processed {len(processed_mic)/SAMPLE_RATE:.2f} seconds of audio through AEC")
 
     def combine_speech_chunks_timer(self):
         while self._running:
@@ -279,7 +290,8 @@ class AudioRecorder:
             if not segments_all:
                 continue
 
-            segments_all.sort(key=lambda x: x["timestamp"])
+            # Sort segments based only on time offset
+            segments_all.sort(key=lambda seg: seg["offset"])
             combined = np.concatenate([seg["data"] for seg in segments_all])
             chunk_int16 = (np.clip(combined, -1.0, 1.0) * 32767).astype(np.int16)
             
@@ -305,8 +317,8 @@ class AudioRecorder:
 
     def start(self):
         threads = [
-            threading.Thread(target=self.record_device, args=('mic',), daemon=True),
-            threading.Thread(target=self.record_device, args=('sys',), daemon=True),
+            threading.Thread(target=self.record_from_device, args=('mic',), daemon=True),
+            threading.Thread(target=self.record_from_device, args=('sys',), daemon=True),
             threading.Thread(target=self.combine_speech_chunks_timer, daemon=True)
         ]
         for thread in threads:
@@ -317,7 +329,6 @@ class AudioRecorder:
                 time.sleep(1)
         except KeyboardInterrupt:
             self._running = False
-            self.record_barrier.reset()  # Break the barrier to allow threads to exit
             print("\nRecording stopped (Ctrl+C pressed)")
         except Exception as e:
             self._running = False
