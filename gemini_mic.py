@@ -15,6 +15,7 @@ from noisereduce import reduce_noise
 import time
 from queue import Queue
 from pyaec import Aec
+from scipy.fft import rfft, irfft
 
 load_dotenv()
 API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -58,40 +59,32 @@ class AudioDevice:
         self.buffer = np.array([], dtype=np.float32)
         return snapshot
 
-class AudioGate:
-    def __init__(self, threshold=0.04, attack_ms=10, release_ms=100, sample_rate=16000, hysteresis_ms=200):
-        self.threshold = threshold
-        self.attack_coef = np.exp(-1.0 / (sample_rate * attack_ms / 1000.0))
-        self.release_coef = np.exp(-1.0 / (sample_rate * release_ms / 1000.0))
-        self.envelope = 0.0
-        self.gain = 0.0
-        self.hysteresis_samples = int(hysteresis_ms * sample_rate / 1000)
-        self.samples_after_threshold = 0
-        self.is_open = False
-
+class VoiceEnhancer:
+    def __init__(self, sample_rate=16000, min_freq=300, max_freq=3400, boost_factor=1.5):
+        self.sample_rate = sample_rate
+        self.min_freq = min_freq
+        self.max_freq = max_freq
+        self.boost_factor = boost_factor
+    
     def process(self, audio):
-        output = np.zeros_like(audio)
-        for i, sample in enumerate(audio):
-            # Envelope follower
-            level = abs(sample)
-            if level > self.envelope:
-                self.envelope = self.attack_coef * self.envelope + (1.0 - self.attack_coef) * level
-            else:
-                self.envelope = self.release_coef * self.envelope + (1.0 - self.release_coef) * level
+        if len(audio) == 0:
+            return audio
             
-            # Gate logic with hysteresis
-            if self.envelope > self.threshold:
-                self.is_open = True
-                self.samples_after_threshold = 0
-            elif self.is_open:
-                self.samples_after_threshold += 1
-                if self.samples_after_threshold >= self.hysteresis_samples:
-                    self.is_open = False
-            
-            self.gain = 1.0 if self.is_open else 0.0
-            output[i] = sample * self.gain
-            
-        return output
+        # Compute the FFT
+        X = rfft(audio)
+        freqs = np.fft.rfftfreq(len(audio), d=1/self.sample_rate)
+        
+        # Define vocal range mask
+        vocal_mask = (freqs >= self.min_freq) & (freqs <= self.max_freq)
+        
+        # Apply boost to the vocal range frequencies
+        X[vocal_mask] *= self.boost_factor
+        
+        # Reconstruct the time-domain signal via inverse FFT
+        enhanced = irfft(X)
+        
+        # Return the enhanced audio as float32 in the same range as input
+        return enhanced.astype(np.float32)
 
 class AudioRecorder:
     def __init__(self, save_dir=None):
@@ -100,7 +93,12 @@ class AudioRecorder:
         self.client = genai.Client(api_key=API_KEY)
         self.devices = self._initialize_devices()
         self._running = True
-        self.gate = AudioGate(threshold=0.015, attack_ms=10, release_ms=100, sample_rate=SAMPLE_RATE, hysteresis_ms=200)
+        self.enhancer = VoiceEnhancer(sample_rate=SAMPLE_RATE, boost_factor=2)
+        
+        # PyAEC parameters - moved from process_chunks
+        self.frame_size = int(0.02 * SAMPLE_RATE)
+        self.filter_length = int(SAMPLE_RATE * 0.2)
+        self.aec = Aec(self.frame_size, self.filter_length, SAMPLE_RATE, True)
 
     def _initialize_devices(self):
         mics = sc.all_microphones(include_loopback=True)
@@ -148,7 +146,9 @@ class AudioRecorder:
             sampling_rate=SAMPLE_RATE,
             return_seconds=True,
             speech_pad_ms=50,
-            min_silence_duration_ms=200
+            min_silence_duration_ms=100,
+            min_speech_duration_ms=200,
+            threshold=0.3
         )
         buffer_seconds = len(buffer_data) / SAMPLE_RATE
         print(f"Detected {len(speech_segments)} speech segments in {device.label} of {buffer_seconds:.1f} seconds.")
@@ -205,15 +205,28 @@ class AudioRecorder:
             print(f"Error during transcription: {e}")
             return ""
 
+    def calculate_rms(self, audio_buffer):
+        """Calculate the Root Mean Square (RMS) of an audio buffer."""
+        if len(audio_buffer) == 0:
+            return 0
+        return np.sqrt(np.mean(np.square(audio_buffer)))
+    
+    def normalize_audio(self, audio, target_rms):
+        """Normalize audio to match a target RMS value."""
+        if len(audio) == 0 or target_rms == 0:
+            return audio
+            
+        current_rms = self.calculate_rms(audio)
+        if current_rms == 0:
+            return audio
+            
+        gain_factor = target_rms / current_rms
+        return audio * gain_factor
+
     def process_chunks(self):
         mic_device = self.devices['mic']
         sys_device = self.devices['sys']
         
-        # PyAEC parameters
-        frame_size = int(0.02 * SAMPLE_RATE)
-        filter_length = int(SAMPLE_RATE * 0.2)
-        aec = Aec(frame_size, filter_length, SAMPLE_RATE, True)
-
         # Empty both queues completely into full buffers
         mic_buffer = np.array([], dtype=np.float32)
         sys_buffer = np.array([], dtype=np.float32)
@@ -250,31 +263,37 @@ class AudioRecorder:
         processed_chunks = []
 
         # Process complete frames
-        for i in range(0, min_length, frame_size):
+        for i in range(0, min_length, self.frame_size):
             # Get the frame (could be partial at the end)
-            mic_frame = mic_int16[i:i+frame_size]
-            sys_frame = sys_int16[i:i+frame_size]
+            mic_frame = mic_int16[i:i+self.frame_size]
+            sys_frame = sys_int16[i:i+self.frame_size]
             
             # If we have a partial frame at the end
-            if min(len(mic_frame), len(sys_frame)) < frame_size:
+            if min(len(mic_frame), len(sys_frame)) < self.frame_size:
                 # Just append the raw partial frame
                 processed_chunks.append(mic_frame)
             else:
                 # Process with echo canceller
-                processed_frame = aec.cancel_echo(mic_frame, sys_frame)
+                processed_frame = self.aec.cancel_echo(mic_frame, sys_frame)
                 processed_chunks.append(processed_frame)
 
         processed_mic = np.concatenate(processed_chunks).astype(np.float32) / 32767.0
 
-        # Noise reduce and apply audio gate to mic after echo cancellation
-        processed_mic = reduce_noise(y=processed_mic, sr=SAMPLE_RATE)
-        processed_mic = self.gate.process(processed_mic)
+        # Noise reduce and apply voice enhancer to mic after echo cancellation
+        #processed_mic = reduce_noise(y=processed_mic, sr=SAMPLE_RATE)
+        #processed_mic = self.enhancer.process(processed_mic)
+        
+        # Calculate RMS of system audio and normalize mic to match it
+        sys_rms = self.calculate_rms(sys_buffer)
+        if sys_rms > 0:
+            processed_mic = self.normalize_audio(processed_mic, sys_rms)
+            print(f"Normalized microphone audio to match system RMS: {sys_rms:.6f}")
 
         # Append processed audio to device buffers
         mic_device.append_audio(processed_mic)
         sys_device.append_audio(sys_buffer)
         
-        print(f"Processed {len(processed_mic)/SAMPLE_RATE:.2f} seconds of audio through AEC")
+        print(f"Processed {len(processed_mic)/SAMPLE_RATE:.2f} seconds of audio through AEC and enhancement")
 
     def combine_speech_chunks_timer(self):
         while self._running:
