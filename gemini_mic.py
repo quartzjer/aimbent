@@ -16,6 +16,7 @@ import time
 from queue import Queue
 from pyaec import Aec
 from scipy.fft import rfft, irfft
+import subprocess
 
 load_dotenv()
 API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -152,7 +153,7 @@ class AudioRecorder:
             buffer_data, self.model,
             sampling_rate=SAMPLE_RATE,
             return_seconds=True,
-            speech_pad_ms=50,
+            speech_pad_ms=70,
             min_silence_duration_ms=100,
             min_speech_duration_ms=200,
             threshold=0.3
@@ -160,10 +161,10 @@ class AudioRecorder:
         buffer_seconds = len(buffer_data) / SAMPLE_RATE
         print(f"Detected {len(speech_segments)} speech segments in {device.label} of {buffer_seconds:.1f} seconds.")
         # Debug: Save buffer to file
-        debug_filename = f"test_{device.label}.ogg"
-        debug_data = (np.clip(buffer_data, -1.0, 1.0) * 32767).astype(np.int16)
-        sf.write(debug_filename, debug_data, SAMPLE_RATE, format='OGG', subtype='VORBIS')
-        print(f"Saved debug file: {debug_filename}")
+        # debug_filename = f"test_{device.label}.ogg"
+        # debug_data = (np.clip(buffer_data, -1.0, 1.0) * 32767).astype(np.int16)
+        # sf.write(debug_filename, debug_data, SAMPLE_RATE, format='OGG', subtype='VORBIS')
+        # print(f"Saved debug file: {debug_filename}")
 
         segments = []
         total_duration = len(buffer_data) / SAMPLE_RATE
@@ -230,7 +231,21 @@ class AudioRecorder:
         gain_factor = target_rms / current_rms
         return audio * gain_factor
 
-    def process_chunks(self):
+    def is_system_muted(self):
+        """Check if the system audio is muted."""
+        try:
+            result = subprocess.run(
+                ["pactl", "get-sink-mute", "@DEFAULT_SINK@"], 
+                capture_output=True, 
+                text=True, 
+                check=True
+            )
+            return "Mute: yes" in result.stdout
+        except subprocess.SubprocessError as e:
+            print(f"Error checking system mute status: {e}")
+            return False
+
+    def process_chunks(self, apply_echo_cancellation=True):
         mic_device = self.devices['mic']
         sys_device = self.devices['sys']
         
@@ -248,88 +263,125 @@ class AudioRecorder:
             chunk = mic_device.queue.get()
             mic_buffer = np.concatenate((mic_buffer, chunk.squeeze(axis=1)))
         
-        # Make sure both buffers have the same length
         min_length = min(len(mic_buffer), len(sys_buffer))
         if min_length == 0:
-            return  # No data to process
+            print("Missing audio data in one or both buffers.")
+            return
 
         print(f"mic seconds {len(mic_buffer)/SAMPLE_RATE:.4f} sys seconds {len(sys_buffer)/SAMPLE_RATE:.4f}")        
 
-        # Save original microphone audio to a file
-        if mic_buffer.size > 0:
-            orig_mic_int16 = (np.clip(mic_buffer, -1.0, 1.0) * 32767).astype(np.int16)
-            sf.write("test_orig.ogg", orig_mic_int16, SAMPLE_RATE, format='OGG', subtype='VORBIS')
-            print(f"Saved original microphone audio to test_orig.ogg ({len(orig_mic_int16)/SAMPLE_RATE:.2f} seconds)")
+        # # Save original microphone audio to a file
+        # if mic_buffer.size > 0:
+        #     orig_mic_int16 = (np.clip(mic_buffer, -1.0, 1.0) * 32767).astype(np.int16)
+        #     sf.write("test_orig.ogg", orig_mic_int16, SAMPLE_RATE, format='OGG', subtype='VORBIS')
+        #     print(f"Saved original microphone audio to test_orig.ogg ({len(orig_mic_int16)/SAMPLE_RATE:.2f} seconds)")
 
-        # Convert float32 arrays to int16 (required by PyAEC)
-        mic_int16 = (mic_buffer * 32767).astype(np.int16)
-        sys_int16 = (sys_buffer * 32767).astype(np.int16)
-        min_length = min(len(mic_int16), len(sys_int16))
+        if apply_echo_cancellation:
+            # Convert float32 arrays to int16 (required by PyAEC)
+            mic_int16 = (mic_buffer * 32767).astype(np.int16)
+            sys_int16 = (sys_buffer * 32767).astype(np.int16)
+            min_length = min(len(mic_int16), len(sys_int16))
 
-        # Process in chunks of frame_size
-        processed_chunks = []
+            # Process in chunks of frame_size
+            processed_chunks = []
 
-        # Process complete frames
-        for i in range(0, min_length, self.frame_size):
-            # Get the frame (could be partial at the end)
-            mic_frame = mic_int16[i:i+self.frame_size]
-            sys_frame = sys_int16[i:i+self.frame_size]
+            # Process complete frames
+            for i in range(0, min_length, self.frame_size):
+                # Get the frame (could be partial at the end)
+                mic_frame = mic_int16[i:i+self.frame_size]
+                sys_frame = sys_int16[i:i+self.frame_size]
+                
+                # If we have a partial frame at the end
+                if min(len(mic_frame), len(sys_frame)) < self.frame_size:
+                    # Just append the raw partial frame
+                    processed_chunks.append(mic_frame)
+                else:
+                    # Process with echo canceller
+                    processed_frame = self.aec.cancel_echo(mic_frame, sys_frame)
+                    processed_chunks.append(processed_frame)
+
+            processed_mic = np.concatenate(processed_chunks).astype(np.float32) / 32767.0
             
-            # If we have a partial frame at the end
-            if min(len(mic_frame), len(sys_frame)) < self.frame_size:
-                # Just append the raw partial frame
-                processed_chunks.append(mic_frame)
-            else:
-                # Process with echo canceller
-                processed_frame = self.aec.cancel_echo(mic_frame, sys_frame)
-                processed_chunks.append(processed_frame)
+            # Only enhance/normalize if we're doing echo cancellation
+            processed_mic = self.enhancer.process(processed_mic)
+            sys_rms = self.calculate_rms(sys_buffer)
+            if sys_rms > 0:
+                processed_mic = self.normalize_audio(processed_mic, sys_rms)
+                print(f"Normalized microphone audio to match system RMS: {sys_rms:.6f}")
 
-        processed_mic = np.concatenate(processed_chunks).astype(np.float32) / 32767.0
-
-        # Noise reduce and apply voice enhancer to mic after echo cancellation
-        #processed_mic = reduce_noise(y=processed_mic, sr=SAMPLE_RATE)
-        #processed_mic = self.enhancer.process(processed_mic)
-        
-        # Calculate RMS of system audio and normalize mic to match it
-        sys_rms = self.calculate_rms(sys_buffer)
-        if sys_rms > 0:
-            processed_mic = self.normalize_audio(processed_mic, sys_rms)
-            print(f"Normalized microphone audio to match system RMS: {sys_rms:.6f}")
-
-        # Append processed audio to device buffers
+        # Append audio to device buffers
         mic_device.append_audio(processed_mic)
         sys_device.append_audio(sys_buffer)
         
-        print(f"Processed {len(processed_mic)/SAMPLE_RATE:.2f} seconds of audio through AEC and enhancement")
+        print(f"Processed {len(processed_mic)/SAMPLE_RATE:.2f} seconds of audio through enhancement")
+
+    def process_segments_and_transcribe(self, segments, suffix=None):
+        """Process audio segments, transcribe, and save results.
+        
+        Args:
+            segments: List of audio segment dictionaries with 'data' and 'offset' keys
+            suffix: Optional suffix to append to the filename (e.g., '_mic')
+        """
+        if not segments:
+            return
+            
+        # Sort segments based only on time offset
+        segments.sort(key=lambda seg: seg["offset"])
+            
+        # Concatenate all segments
+        combined = np.concatenate([seg["data"] for seg in segments])
+        chunk_int16 = (np.clip(combined, -1.0, 1.0) * 32767).astype(np.int16)
+        
+        # Create OGG file
+        buf = io.BytesIO()
+        audio_data = chunk_int16.reshape(-1, CHANNELS)
+        sf.write(buf, audio_data, SAMPLE_RATE, format='OGG', subtype='VORBIS')
+        ogg_bytes = buf.getvalue()
+        
+        # Transcribe audio
+        response_text = self.transcribe(ogg_bytes)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Add suffix if provided
+        if suffix:
+            timestamp += suffix
+            
+        # Save results
+        self.save_results(timestamp, ogg_bytes, response_text)
 
     def combine_speech_chunks_timer(self):
         while self._running:
-            time.sleep(20)
-            self.process_chunks()
+            time.sleep(60)
             
-            segments_all = []
-            for _, device in self.devices.items():
-                segments = self.process_buffer(device)
-                segments_all.extend(segments)
-                print(f"Processed {len(segments)} segments from {device.label}.")
+            system_muted = self.is_system_muted()
+            print(f"System audio mute status: {'Muted' if system_muted else 'Not muted'}")
+            
+            self.process_chunks(apply_echo_cancellation=(not system_muted))
+            
+            if system_muted:
+                # Handle microphone separately when system is muted
+                mic_segments = self.process_buffer(self.devices['mic'])
+                if mic_segments:
+                    self.process_segments_and_transcribe(mic_segments, suffix="_mic")
+                    print(f"Found {len(mic_segments)} microphone segments")
+                else:
+                    print("No microphone segments found")
+                
+                # Process any system audio
+                sys_segments = self.process_buffer(self.devices['sys'])
+                if sys_segments:
+                    self.process_segments_and_transcribe(sys_segments)
+                    print(f"Found {len(sys_segments)} system audio segments")
+            else:
+                # Merge all segments from both devices
+                segments_all = []
+                for _, device in self.devices.items():
+                    segments = self.process_buffer(device)
+                    segments_all.extend(segments)
+                    print(f"Processed {len(segments)} segments from {device.label}.")
 
-            if not segments_all:
-                continue
-
-            # Sort segments based only on time offset
-            segments_all.sort(key=lambda seg: seg["offset"])
-            combined = np.concatenate([seg["data"] for seg in segments_all])
-            chunk_int16 = (np.clip(combined, -1.0, 1.0) * 32767).astype(np.int16)
-            
-            buf = io.BytesIO()
-            audio_data = chunk_int16.reshape(-1, CHANNELS)
-            sf.write(buf, audio_data, SAMPLE_RATE, format='OGG', subtype='VORBIS')
-            ogg_bytes = buf.getvalue()
-            
-            response_text = self.transcribe(ogg_bytes)
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            
-            self.save_results(timestamp, ogg_bytes, response_text)
+                segments_all.sort(key=lambda seg: seg["offset"])
+                self.process_segments_and_transcribe(segments_all)
 
     def save_results(self, timestamp, ogg_bytes, response_text):
         ogg_filepath = os.path.join(self.save_dir, f"audio_{timestamp}.ogg")
