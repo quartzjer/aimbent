@@ -69,7 +69,14 @@ class VoiceEnhancer:
     def process(self, audio):
         if len(audio) == 0:
             return audio
-            
+
+        # clean edges
+        audio = np.nan_to_num(audio, nan=0.0, posinf=1e10, neginf=-1e10)
+        audio = np.where(audio == 0, 1e-10, audio)
+
+        # Apply noise reduction
+        audio = reduce_noise(y=audio, sr=self.sample_rate)
+
         # Compute the FFT
         X = rfft(audio)
         freqs = np.fft.rfftfreq(len(audio), d=1/self.sample_rate)
