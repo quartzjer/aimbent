@@ -5,3 +5,13 @@ python-dotenv
 pyaudio
 websocket-client
 pyrtmp
+pyaec
+noisereduce
+silero_vad
+soundfile
+soundcard
+google-genai
+scikit-image
+opencv-python
+cv2
+dbus-next
