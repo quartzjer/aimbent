@@ -3,11 +3,12 @@ import argparse
 import os
 import time
 import datetime
-import json  # added import
+import json
+import sys  # for sys.exit
 from PIL import ImageDraw
 from screen_dbus import screen_snap
 from screen_compare import compare_images
-import gemini_look  # added import
+import gemini_look
 
 GLOBAL_VERBOSE = False
 
@@ -16,7 +17,7 @@ def log(message, force=False):
     if GLOBAL_VERBOSE or force:
         print(message)
 
-def process_screenshots(interval, output_dir, min_threshold, use_gemini):  # added use_gemini parameter
+def process_screenshots(interval, output_dir, min_threshold, use_gemini):
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
@@ -60,7 +61,7 @@ def process_screenshots(interval, output_dir, min_threshold, use_gemini):  # add
                         filename = os.path.join(output_dir, f"monitor_{idx}_{timestamp}_diff.png")
                         annotated.save(filename)
                         log(f"[Monitor {idx}] Saved annotated diff image: {filename}", force=True)
-                        if use_gemini:  # new block for gemini integration
+                        if use_gemini:
                             result = gemini_look.gemini_describe_region(pil_img, largest_box)
                             if result:
                                 json_filename = os.path.splitext(filename)[0] + ".json"
@@ -83,11 +84,21 @@ def main():
     parser.add_argument("directory", type=str, help="Directory to save screenshots")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--min", type=int, default=400, help="Minimum size threshold for a bounding box (pixels)")
-    parser.add_argument("-g", "--gemini", action="store_true", help="Call Gemini API when differences are detected")  # added gemini option
+    parser.add_argument("-g", "--gemini", action="store_true", help="Call Gemini API when differences are detected")
     args = parser.parse_args()
     global GLOBAL_VERBOSE
     GLOBAL_VERBOSE = args.verbose
-    process_screenshots(args.interval, args.directory, args.min, args.gemini)  # pass gemini flag
+    
+    # Initialize Gemini client if needed
+    if args.gemini:
+        try:
+            gemini_look.initialize()
+            log("Gemini API client initialized successfully", force=True)
+        except Exception as e:
+            log(f"Failed to initialize Gemini API: {str(e)}", force=True)
+            sys.exit(1)
+    
+    process_screenshots(args.interval, args.directory, args.min, args.gemini)
 
 if __name__ == '__main__':
     main()
