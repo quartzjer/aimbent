@@ -40,26 +40,10 @@ class AudioDevice:
     def __init__(self, device, label):
         self.device = device
         self.label = label
-        self.buffer = np.array([], dtype=np.float32)
         self.queue = Queue()
-        self.is_suppressed = False
-        self.last_active_time = None
 
     def queue_chunk(self, audio_data):
         self.queue.put(audio_data)
-
-    def append_audio(self, audio_data):
-        self.buffer = np.concatenate((self.buffer, audio_data))
-
-    def prepend_audio(self, audio_data):
-        self.buffer = np.concatenate((audio_data, self.buffer)) if self.buffer.size > 0 else audio_data
-
-    def get_and_clear_buffer(self):
-        if self.buffer.size == 0:
-            return None
-        snapshot = self.buffer.copy()
-        self.buffer = np.array([], dtype=np.float32)
-        return snapshot
 
 class VoiceEnhancer:
     def __init__(self, sample_rate=16000, min_freq=300, max_freq=3400, boost_factor=1.5):
@@ -105,7 +89,7 @@ class AudioRecorder:
         self.enhancer = VoiceEnhancer(sample_rate=SAMPLE_RATE, boost_factor=2)
         self.debug = debug
         
-        # PyAEC parameters - moved from process_chunks
+        # PyAEC parameters
         self.frame_size = int(0.02 * SAMPLE_RATE)
         self.filter_length = int(SAMPLE_RATE * 0.2)
         self.aec = Aec(self.frame_size, self.filter_length, SAMPLE_RATE, True)
@@ -146,9 +130,8 @@ class AudioRecorder:
             if self._running:  # Only log if not due to shutdown
                 print(f"Recording thread for {device.label} crashed: {e}")
 
-    def process_buffer(self, device):
-        buffer_data = device.get_and_clear_buffer()
-        if buffer_data is None:
+    def process_buffer(self, device_key, buffer_data):
+        if buffer_data is None or len(buffer_data) == 0:
             return []
             
         speech_segments = get_speech_timestamps(
@@ -161,24 +144,24 @@ class AudioRecorder:
             threshold=0.3
         )
         buffer_seconds = len(buffer_data) / SAMPLE_RATE
-        print(f"Detected {len(speech_segments)} speech segments in {device.label} of {buffer_seconds:.1f} seconds.")
+        print(f"Detected {len(speech_segments)} speech segments in {self.devices[device_key].label} of {buffer_seconds:.1f} seconds.")
         # Debug: Save buffer to file
         if self.debug:
-            debug_filename = f"test_{device.label}.ogg"
+            debug_filename = f"test_{self.devices[device_key].label}.ogg"
             debug_data = (np.clip(buffer_data, -1.0, 1.0) * 32767).astype(np.int16)
             sf.write(debug_filename, debug_data, SAMPLE_RATE, format='OGG', subtype='VORBIS')
             print(f"Saved debug file: {debug_filename}")
 
         segments = []
         total_duration = len(buffer_data) / SAMPLE_RATE
+        unprocessed_data = np.array([], dtype=np.float32)
 
         for i, seg in enumerate(speech_segments):
             # If the last segment is too close to the end the speaking might be continuing
             if i == len(speech_segments) - 1 and total_duration - seg['end'] < 1:
                 start_idx = int(seg['start'] * SAMPLE_RATE)
-                unprocessed = buffer_data[start_idx:]
-                device.prepend_audio(unprocessed)
-                print(f"Unprocessed segment at end of {device.label} buffer of length {len(unprocessed)/SAMPLE_RATE:.1f} seconds.")
+                unprocessed_data = buffer_data[start_idx:]
+                print(f"Unprocessed segment at end of {self.devices[device_key].label} buffer of length {len(unprocessed_data)/SAMPLE_RATE:.1f} seconds.")
                 break
             start_idx = int(seg['start'] * SAMPLE_RATE)
             end_idx = int(seg['end'] * SAMPLE_RATE)
@@ -188,7 +171,7 @@ class AudioRecorder:
                 "data": seg_data
             })
         
-        return segments
+        return segments, unprocessed_data
 
     def transcribe(self, ogg_bytes):
         size_mb = len(ogg_bytes) / (1024 * 1024)
@@ -252,73 +235,61 @@ class AudioRecorder:
         mic_device = self.devices['mic']
         sys_device = self.devices['sys']
         
-        # Empty both queues completely into full buffers
         mic_buffer = np.array([], dtype=np.float32)
         sys_buffer = np.array([], dtype=np.float32)
         
-        # Collect all audio from system queue
         while not sys_device.queue.empty():
             chunk = sys_device.queue.get()
             sys_buffer = np.concatenate((sys_buffer, chunk.squeeze(axis=1)))
 
-        # Collect all audio from mic queue
         while not mic_device.queue.empty():
             chunk = mic_device.queue.get()
             mic_buffer = np.concatenate((mic_buffer, chunk.squeeze(axis=1)))
         
         return mic_buffer, sys_buffer
 
-    def process_audio_buffers(self, mic_buffer, sys_buffer, apply_echo_cancellation=True):
-        mic_device = self.devices['mic']
-        sys_device = self.devices['sys']
+    def apply_echo_cancellation(self, mic_buffer, sys_buffer):
         
         min_length = min(len(mic_buffer), len(sys_buffer))
         if min_length == 0:
             print("Missing audio data in one or both buffers.")
-            return
+            return mic_buffer, sys_buffer
 
-        print(f"mic seconds {len(mic_buffer)/SAMPLE_RATE:.4f} sys seconds {len(sys_buffer)/SAMPLE_RATE:.4f}")        
+        print(f"echo cancelling mic seconds {len(mic_buffer)/SAMPLE_RATE:.4f} sys seconds {len(sys_buffer)/SAMPLE_RATE:.4f}")        
 
-        if apply_echo_cancellation:
-            # Convert float32 arrays to int16 (required by PyAEC)
-            mic_int16 = (mic_buffer * 32767).astype(np.int16)
-            sys_int16 = (sys_buffer * 32767).astype(np.int16)
-            min_length = min(len(mic_int16), len(sys_int16))
+        # Convert float32 arrays to int16 (required by PyAEC)
+        mic_int16 = (mic_buffer * 32767).astype(np.int16)
+        sys_int16 = (sys_buffer * 32767).astype(np.int16)
+        min_length = min(len(mic_int16), len(sys_int16))
 
-            # Process in chunks of frame_size
-            processed_chunks = []
+        # Process in chunks of frame_size
+        processed_chunks = []
 
-            # Process complete frames
-            for i in range(0, min_length, self.frame_size):
-                # Get the frame (could be partial at the end)
-                mic_frame = mic_int16[i:i+self.frame_size]
-                sys_frame = sys_int16[i:i+self.frame_size]
-                
-                # If we have a partial frame at the end
-                if min(len(mic_frame), len(sys_frame)) < self.frame_size:
-                    # Just append the raw partial frame
-                    processed_chunks.append(mic_frame)
-                else:
-                    # Process with echo canceller
-                    processed_frame = self.aec.cancel_echo(mic_frame, sys_frame)
-                    processed_chunks.append(processed_frame)
-
-            processed_mic = np.concatenate(processed_chunks).astype(np.float32) / 32767.0
+        # Process complete frames
+        for i in range(0, min_length, self.frame_size):
+            # Get the frame (could be partial at the end)
+            mic_frame = mic_int16[i:i+self.frame_size]
+            sys_frame = sys_int16[i:i+self.frame_size]
             
-            # Only enhance/normalize if we're doing echo cancellation
-            processed_mic = self.enhancer.process(processed_mic)
-            sys_rms = self.calculate_rms(sys_buffer)
-            if sys_rms > 0:
-                processed_mic = self.normalize_audio(processed_mic, sys_rms)
-                print(f"Normalized microphone audio to match system RMS: {sys_rms:.6f}")
-        else:
-            processed_mic = mic_buffer
+            # If we have a partial frame at the end
+            if min(len(mic_frame), len(sys_frame)) < self.frame_size:
+                # Just append the raw partial frame
+                processed_chunks.append(mic_frame)
+            else:
+                # Process with echo canceller
+                processed_frame = self.aec.cancel_echo(mic_frame, sys_frame)
+                processed_chunks.append(processed_frame)
 
-        # Append audio to device buffers
-        mic_device.append_audio(processed_mic)
-        sys_device.append_audio(sys_buffer)
+        processed_mic = np.concatenate(processed_chunks).astype(np.float32) / 32767.0
         
-        print(f"Processed {len(processed_mic)/SAMPLE_RATE:.2f} seconds of audio through enhancement")
+        # Only enhance/normalize if we're doing echo cancellation
+        processed_mic = self.enhancer.process(processed_mic)
+        sys_rms = self.calculate_rms(sys_buffer)
+        if sys_rms > 0:
+            processed_mic = self.normalize_audio(processed_mic, sys_rms)
+            print(f"Normalized microphone audio to match system RMS: {sys_rms:.6f}")
+        
+        return processed_mic
 
     def process_segments_and_transcribe(self, segments, suffix=None):
         """Process audio segments, transcribe, and save results.
@@ -354,40 +325,66 @@ class AudioRecorder:
         # Save results
         self.save_results(timestamp, ogg_bytes, response_text)
 
-    def combine_speech_chunks_timer(self):
+    def speech_processing_timer(self):
+        # Initialize local buffers
+        mic_buffer = np.array([], dtype=np.float32)
+        sys_buffer = np.array([], dtype=np.float32)
+        
         while self._running:
             time.sleep(60)
             
             system_muted = self.is_system_muted()
             print(f"System audio mute status: {'Muted' if system_muted else 'Not muted'}")
             
-            mic_buffer, sys_buffer = self.get_device_buffers()
-            self.process_audio_buffers(mic_buffer, sys_buffer, apply_echo_cancellation=(not system_muted))
-            
+            # Get new audio data and add to existing buffers
+            new_mic, new_sys = self.get_device_buffers()
+
+            # If system speaker is muted (no echo), process audio separately
             if system_muted:
-                # Handle microphone separately when system is muted
-                mic_segments = self.process_buffer(self.devices['mic'])
+                mic_buffer = np.concatenate((mic_buffer, new_mic)) if mic_buffer.size > 0 else new_mic
+                sys_buffer = np.concatenate((sys_buffer, new_sys)) if sys_buffer.size > 0 else new_sys
+
+                mic_segments, unprocessed_mic = self.process_buffer('mic', mic_buffer)
                 if mic_segments:
                     self.process_segments_and_transcribe(mic_segments, suffix="_mic")
                     print(f"Found {len(mic_segments)} microphone segments")
                 else:
                     print("No microphone segments found")
                 
-                # Process any system audio
-                sys_segments = self.process_buffer(self.devices['sys'])
+                sys_segments, unprocessed_sys = self.process_buffer('sys', sys_buffer)
                 if sys_segments:
-                    self.process_segments_and_transcribe(sys_segments)
+                    self.process_segments_and_transcribe(sys_segments, suffix="_sys")
                     print(f"Found {len(sys_segments)} system audio segments")
+                else:
+                    print("No system audio segments found")
+                
+                # Retain unprocessed audio for next cycle
+                mic_buffer = unprocessed_mic
+                sys_buffer = unprocessed_sys
             else:
+                # Speaker is on, apply echo cancellation
+                new_mic = self.apply_echo_cancellation(new_mic, new_sys)
+
+                mic_buffer = np.concatenate((mic_buffer, new_mic)) if mic_buffer.size > 0 else new_mic
+                sys_buffer = np.concatenate((sys_buffer, new_sys)) if sys_buffer.size > 0 else new_sys
+
                 # Merge all segments from both devices
                 segments_all = []
-                for _, device in self.devices.items():
-                    segments = self.process_buffer(device)
-                    segments_all.extend(segments)
-                    print(f"Processed {len(segments)} segments from {device.label}.")
+                mic_segments, unprocessed_mic = self.process_buffer('mic', mic_buffer)
+                sys_segments, unprocessed_sys = self.process_buffer('sys', sys_buffer)
+                segments_all.extend(mic_segments)
+                segments_all.extend(sys_segments)
 
-                segments_all.sort(key=lambda seg: seg["offset"])
-                self.process_segments_and_transcribe(segments_all)
+                print(f"Processed {len(mic_segments)} segments from microphone.")
+                print(f"Processed {len(sys_segments)} segments from system audio.")
+
+                if segments_all:
+                    segments_all.sort(key=lambda seg: seg["offset"])
+                    self.process_segments_and_transcribe(segments_all)
+                
+                # Retain unprocessed audio for next cycle
+                mic_buffer = unprocessed_mic
+                sys_buffer = unprocessed_sys
 
     def save_results(self, timestamp, ogg_bytes, response_text):
         ogg_filepath = os.path.join(self.save_dir, f"audio_{timestamp}.ogg")
@@ -403,7 +400,7 @@ class AudioRecorder:
         threads = [
             threading.Thread(target=self.record_from_device, args=('mic',), daemon=True),
             threading.Thread(target=self.record_from_device, args=('sys',), daemon=True),
-            threading.Thread(target=self.combine_speech_chunks_timer, daemon=True)
+            threading.Thread(target=self.speech_processing_timer, daemon=True)
         ]
         for thread in threads:
             thread.start()
