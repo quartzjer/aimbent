@@ -248,7 +248,7 @@ class AudioRecorder:
             print(f"Error checking system mute status: {e}")
             return False
 
-    def process_chunks(self, apply_echo_cancellation=True):
+    def get_device_buffers(self):
         mic_device = self.devices['mic']
         sys_device = self.devices['sys']
         
@@ -265,6 +265,12 @@ class AudioRecorder:
         while not mic_device.queue.empty():
             chunk = mic_device.queue.get()
             mic_buffer = np.concatenate((mic_buffer, chunk.squeeze(axis=1)))
+        
+        return mic_buffer, sys_buffer
+
+    def process_audio_buffers(self, mic_buffer, sys_buffer, apply_echo_cancellation=True):
+        mic_device = self.devices['mic']
+        sys_device = self.devices['sys']
         
         min_length = min(len(mic_buffer), len(sys_buffer))
         if min_length == 0:
@@ -355,7 +361,8 @@ class AudioRecorder:
             system_muted = self.is_system_muted()
             print(f"System audio mute status: {'Muted' if system_muted else 'Not muted'}")
             
-            self.process_chunks(apply_echo_cancellation=(not system_muted))
+            mic_buffer, sys_buffer = self.get_device_buffers()
+            self.process_audio_buffers(mic_buffer, sys_buffer, apply_echo_cancellation=(not system_muted))
             
             if system_muted:
                 # Handle microphone separately when system is muted
