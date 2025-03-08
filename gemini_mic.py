@@ -17,6 +17,7 @@ from queue import Queue
 from pyaec import Aec
 from scipy.fft import rfft, irfft
 import subprocess
+import argparse
 
 load_dotenv()
 API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -95,13 +96,14 @@ class VoiceEnhancer:
         return enhanced.astype(np.float32)
 
 class AudioRecorder:
-    def __init__(self, save_dir=None):
+    def __init__(self, save_dir=None, debug=False):
         self.save_dir = save_dir or os.getcwd()
         self.model = load_silero_vad()
         self.client = genai.Client(api_key=API_KEY)
         self.devices = self._initialize_devices()
         self._running = True
         self.enhancer = VoiceEnhancer(sample_rate=SAMPLE_RATE, boost_factor=2)
+        self.debug = debug
         
         # PyAEC parameters - moved from process_chunks
         self.frame_size = int(0.02 * SAMPLE_RATE)
@@ -161,10 +163,11 @@ class AudioRecorder:
         buffer_seconds = len(buffer_data) / SAMPLE_RATE
         print(f"Detected {len(speech_segments)} speech segments in {device.label} of {buffer_seconds:.1f} seconds.")
         # Debug: Save buffer to file
-        # debug_filename = f"test_{device.label}.ogg"
-        # debug_data = (np.clip(buffer_data, -1.0, 1.0) * 32767).astype(np.int16)
-        # sf.write(debug_filename, debug_data, SAMPLE_RATE, format='OGG', subtype='VORBIS')
-        # print(f"Saved debug file: {debug_filename}")
+        if self.debug:
+            debug_filename = f"test_{device.label}.ogg"
+            debug_data = (np.clip(buffer_data, -1.0, 1.0) * 32767).astype(np.int16)
+            sf.write(debug_filename, debug_data, SAMPLE_RATE, format='OGG', subtype='VORBIS')
+            print(f"Saved debug file: {debug_filename}")
 
         segments = []
         total_duration = len(buffer_data) / SAMPLE_RATE
@@ -270,12 +273,6 @@ class AudioRecorder:
 
         print(f"mic seconds {len(mic_buffer)/SAMPLE_RATE:.4f} sys seconds {len(sys_buffer)/SAMPLE_RATE:.4f}")        
 
-        # # Save original microphone audio to a file
-        # if mic_buffer.size > 0:
-        #     orig_mic_int16 = (np.clip(mic_buffer, -1.0, 1.0) * 32767).astype(np.int16)
-        #     sf.write("test_orig.ogg", orig_mic_int16, SAMPLE_RATE, format='OGG', subtype='VORBIS')
-        #     print(f"Saved original microphone audio to test_orig.ogg ({len(orig_mic_int16)/SAMPLE_RATE:.2f} seconds)")
-
         if apply_echo_cancellation:
             # Convert float32 arrays to int16 (required by PyAEC)
             mic_int16 = (mic_buffer * 32767).astype(np.int16)
@@ -308,6 +305,8 @@ class AudioRecorder:
             if sys_rms > 0:
                 processed_mic = self.normalize_audio(processed_mic, sys_rms)
                 print(f"Normalized microphone audio to match system RMS: {sys_rms:.6f}")
+        else:
+            processed_mic = mic_buffer
 
         # Append audio to device buffers
         mic_device.append_audio(processed_mic)
@@ -413,8 +412,12 @@ class AudioRecorder:
             print(f"Error during recording: {e}")
 
 def main():
-    save_dir = sys.argv[1] if len(sys.argv) > 1 else None
-    recorder = AudioRecorder(save_dir)
+    parser = argparse.ArgumentParser(description="Record audio and transcribe using Gemini API.")
+    parser.add_argument("save_dir", nargs="?", default=None, help="Directory to save audio and transcriptions.")
+    parser.add_argument("-d", "--debug", action="store_true", help="Enable debug mode (save audio buffers).")
+    args = parser.parse_args()
+
+    recorder = AudioRecorder(args.save_dir, args.debug)
     recorder.start()
 
 if __name__ == "__main__":
