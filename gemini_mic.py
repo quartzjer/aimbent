@@ -80,7 +80,7 @@ class VoiceEnhancer:
         return enhanced.astype(np.float32)
 
 class AudioRecorder:
-    def __init__(self, save_dir=None, debug=False):
+    def __init__(self, save_dir=None, debug=False, timer_interval=60):
         self.save_dir = save_dir or os.getcwd()
         self.model = load_silero_vad()
         self.client = genai.Client(api_key=API_KEY)
@@ -93,6 +93,7 @@ class AudioRecorder:
         self.frame_size = int(0.02 * SAMPLE_RATE)
         self.filter_length = int(SAMPLE_RATE * 0.2)
         self.aec = Aec(self.frame_size, self.filter_length, SAMPLE_RATE, True)
+        self.timer_interval = timer_interval
 
     def _initialize_devices(self):
         mics = sc.all_microphones(include_loopback=True)
@@ -331,7 +332,7 @@ class AudioRecorder:
         sys_buffer = np.array([], dtype=np.float32)
         
         while self._running:
-            time.sleep(60)
+            time.sleep(self.timer_interval)
             
             system_muted = self.is_system_muted()
             print(f"System audio mute status: {'Muted' if system_muted else 'Not muted'}")
@@ -419,9 +420,10 @@ def main():
     parser = argparse.ArgumentParser(description="Record audio and transcribe using Gemini API.")
     parser.add_argument("save_dir", nargs="?", default=None, help="Directory to save audio and transcriptions.")
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug mode (save audio buffers).")
+    parser.add_argument("-t", "--timer_interval", type=int, default=60, help="Timer interval in seconds.")
     args = parser.parse_args()
 
-    recorder = AudioRecorder(args.save_dir, args.debug)
+    recorder = AudioRecorder(args.save_dir, args.debug, args.timer_interval)
     recorder.start()
 
 if __name__ == "__main__":
