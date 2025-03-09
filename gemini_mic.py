@@ -42,8 +42,6 @@ class AudioRecorder:
         self.save_dir = save_dir or os.getcwd()
         self.model = load_silero_vad()
         self.client = genai.Client(api_key=API_KEY)
-        # Initialize devices and separate queues for mic and system audio
-        self.mic_device, self.sys_device = self._initialize_devices()
         self.mic_queue = Queue()
         self.sys_queue = Queue()
         self._running = True
@@ -87,18 +85,18 @@ class AudioRecorder:
         # Return the enhanced audio as float32 in the same range as input
         return enhanced.astype(np.float32)
 
-    def _initialize_devices(self):
+    def detect(self):
         mic, loopback = audio_detect()
         if mic is None or loopback is None:
-            raise RuntimeError("Failed to detect required audio devices!")
-        print("Using devices:")
-        print(f"Microphone: {mic.name}")
-        print(f"System audio: {loopback.name}")
-        return mic, loopback
+            print(f"Detection failed: mic {mic} sys {loopback}")
+            return False
+        print(f"Detected microphone: {mic.name}")
+        print(f"Detected system audio: {loopback.name}")
+        self.mic_device = mic
+        self.sys_device = loopback
+        return True
 
-    # New generic recording method accepting device, queue and label.
     def record_device(self, device, queue, label):
-        print(f"Starting recording thread for {label}: {device.name}")
         try:
             with device.recorder(samplerate=SAMPLE_RATE, channels=[-1]) as recorder:
                 while self._running:
@@ -118,8 +116,9 @@ class AudioRecorder:
 
     def detect_speech(self, label, buffer_data):
         if buffer_data is None or len(buffer_data) == 0:
+            print(f"No audio data found in {label} buffer.")
             return [], np.array([], dtype=np.float32)
-            
+
         speech_segments = get_speech_timestamps(
             buffer_data, self.model,
             sampling_rate=SAMPLE_RATE,
@@ -183,13 +182,11 @@ class AudioRecorder:
             return ""
 
     def calculate_rms(self, audio_buffer):
-        """Calculate the Root Mean Square (RMS) of an audio buffer."""
         if len(audio_buffer) == 0:
             return 0
         return np.sqrt(np.mean(np.square(audio_buffer)))
     
     def normalize_audio(self, audio, target_rms):
-        """Normalize audio to match a target RMS value."""
         if len(audio) == 0 or target_rms == 0:
             return audio
             
@@ -201,7 +198,6 @@ class AudioRecorder:
         return audio * gain_factor
 
     def is_system_muted(self):
-        """Check if the system audio is muted."""
         try:
             result = subprocess.run(
                 ["pactl", "get-sink-mute", "@DEFAULT_SINK@"], 
@@ -214,33 +210,29 @@ class AudioRecorder:
             print(f"Error checking system mute status: {e}")
             return False
 
-    def get_device_buffers(self):
-        mic_buffer = np.array([], dtype=np.float32)
-        sys_buffer = np.array([], dtype=np.float32)
-        
-        while not self.sys_queue.empty():
-            chunk = self.sys_queue.get()
-            sys_buffer = np.concatenate((sys_buffer, chunk.squeeze(axis=1)))
-
-        while not self.mic_queue.empty():
-            chunk = self.mic_queue.get()
-            mic_buffer = np.concatenate((mic_buffer, chunk.squeeze(axis=1)))
-        
-        return mic_buffer, sys_buffer
+    def get_buffer(self, queue):
+        buffer = np.array([], dtype=np.float32)
+        while not queue.empty():
+            chunk = queue.get()
+            if chunk.ndim > 1:
+                chunk_mono = np.mean(chunk, axis=1).flatten()
+            else:
+                chunk_mono = chunk.flatten()
+            buffer = np.concatenate((buffer, chunk_mono))
+        return buffer
 
     def apply_echo_cancellation(self, mic_buffer, sys_buffer):
-        
         min_length = min(len(mic_buffer), len(sys_buffer))
         if min_length == 0:
             print("Missing audio data in one or both buffers.")
-            return mic_buffer, sys_buffer
+            return mic_buffer
 
         sys_rms = self.calculate_rms(sys_buffer)
         if sys_rms < 0.01:
             print("System audio is silent.")
-            return mic_buffer, sys_buffer
+            return mic_buffer
 
-        print(f"echo cancelling mic seconds {len(mic_buffer)/SAMPLE_RATE:.4f} sys seconds {len(sys_buffer)/SAMPLE_RATE:.4f}")        
+        print(f"Echo cancelling mic seconds {len(mic_buffer)/SAMPLE_RATE:.4f} sys seconds {len(sys_buffer)/SAMPLE_RATE:.4f}")        
 
         # Convert float32 arrays to int16 (required by PyAEC)
         mic_int16 = (mic_buffer * 32767).astype(np.int16)
@@ -306,7 +298,8 @@ class AudioRecorder:
             time.sleep(self.timer_interval)
             system_muted = self.is_system_muted()
             print(f"System audio mute status: {'Muted' if system_muted else 'Not muted'}")
-            new_mic, new_sys = self.get_device_buffers()
+            new_mic = self.get_buffer(self.mic_queue)
+            new_sys = self.get_buffer(self.sys_queue)
             if system_muted:
                 mic_buffer = np.concatenate((mic_buffer, new_mic)) if mic_buffer.size > 0 else new_mic
                 sys_buffer = np.concatenate((sys_buffer, new_sys)) if sys_buffer.size > 0 else new_sys
@@ -333,7 +326,7 @@ class AudioRecorder:
                 sys_segments, unprocessed_sys = self.detect_speech("sys", sys_buffer)
                 segments_all.extend(mic_segments)
                 segments_all.extend(sys_segments)
-                print(f"Found {len(mic_segments)} microphon and {len(sys_segments)} system segments.")
+                print(f"Found {len(mic_segments)} microphone and {len(sys_segments)} system segments.")
                 if segments_all:
                     segments_all.sort(key=lambda seg: seg["offset"]) # weave together in time
                     self.process_segments_and_transcribe(segments_all)
@@ -377,6 +370,7 @@ def main():
     args = parser.parse_args()
 
     recorder = AudioRecorder(args.save_dir, args.debug, args.timer_interval)
+    recorder.detect()
     recorder.start()
 
 if __name__ == "__main__":
