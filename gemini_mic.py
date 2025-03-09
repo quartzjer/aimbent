@@ -20,6 +20,7 @@ import subprocess
 import argparse
 import logging
 from audio_detect import audio_detect
+from typing import List, Tuple
 
 # Constants
 CHUNK_DURATION = 5
@@ -277,47 +278,35 @@ class AudioRecorder:
             timestamp += suffix
         self.save_results(timestamp, ogg_bytes, transcription)
 
+    def process_buffer(self, buffer, new_data, label):
+        merged = np.concatenate((buffer, new_data)) if buffer.size > 0 else new_data
+        segments, unprocessed = self.detect_speech(label, merged)
+        return segments, unprocessed
+
     def speech_processing_timer(self):
-        mic_buffer = np.array([], dtype=np.float32)
-        sys_buffer = np.array([], dtype=np.float32)
+        mic_stash = np.array([], dtype=np.float32)
+        sys_stash = np.array([], dtype=np.float32)
         while self._running:
             time.sleep(self.timer_interval)
             system_muted = self.is_system_muted()
             logging.info(f"System audio mute status: {'Muted' if system_muted else 'Not muted'}")
-            new_mic = self.get_buffer(self.mic_queue)
-            new_sys = self.get_buffer(self.sys_queue)
+
+            sys_new = self.get_buffer(self.sys_queue)
+            sys_segments, sys_stash = self.process_buffer(sys_stash, sys_new, "sys")
+            mic_new = self.get_buffer(self.mic_queue)
+
             if system_muted:
-                mic_buffer = np.concatenate((mic_buffer, new_mic)) if mic_buffer.size > 0 else new_mic
-                sys_buffer = np.concatenate((sys_buffer, new_sys)) if sys_buffer.size > 0 else new_sys
-                mic_segments, unprocessed_mic = self.detect_speech("mic", mic_buffer)
-                if mic_segments:
-                    self.process_segments_and_transcribe(mic_segments, suffix="_mic")
-                    logging.info(f"Found {len(mic_segments)} microphone segments")
-                else:
-                    logging.info("No microphone segments found")
-                sys_segments, unprocessed_sys = self.detect_speech("sys", sys_buffer)
-                if sys_segments:
-                    self.process_segments_and_transcribe(sys_segments, suffix="_sys")
-                    logging.info(f"Found {len(sys_segments)} system audio segments")
-                else:
-                    logging.info("No system audio segments found")
-                mic_buffer = unprocessed_mic
-                sys_buffer = unprocessed_sys
+                mic_segments, mic_stash = self.process_buffer(mic_stash, mic_new, "mic")
+                self.process_segments_and_transcribe(mic_segments, suffix="_mic")
+                self.process_segments_and_transcribe(sys_segments, suffix="_sys")
             else:
-                new_mic = self.apply_echo_cancellation(new_mic, new_sys)
-                mic_buffer = np.concatenate((mic_buffer, new_mic)) if mic_buffer.size > 0 else new_mic
-                sys_buffer = np.concatenate((sys_buffer, new_sys)) if sys_buffer.size > 0 else new_sys
-                segments_all = []
-                mic_segments, unprocessed_mic = self.detect_speech("mic", mic_buffer)
-                sys_segments, unprocessed_sys = self.detect_speech("sys", sys_buffer)
-                segments_all.extend(mic_segments)
-                segments_all.extend(sys_segments)
-                logging.info(f"Found {len(mic_segments)} microphone and {len(sys_segments)} system segments.")
+                mic_processed = self.apply_echo_cancellation(mic_new, sys_new)
+                mic_segments, mic_stash = self.process_buffer(mic_stash, mic_processed, "mic")
+                segments_all = mic_segments + sys_segments
                 if segments_all:
-                    segments_all.sort(key=lambda seg: seg["offset"]) # weave together in time
+                    segments_all.sort(key=lambda seg: seg["offset"])  # weave together in time
                     self.process_segments_and_transcribe(segments_all)
-                mic_buffer = unprocessed_mic
-                sys_buffer = unprocessed_sys
+            logging.info(f"Found {len(mic_segments)} microphone and {len(sys_segments)} system segments.")
 
     def save_results(self, timestamp, ogg_bytes, response_text):
         ogg_filepath = os.path.join(self.save_dir, f"audio_{timestamp}.ogg")
