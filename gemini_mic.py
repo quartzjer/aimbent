@@ -21,28 +21,16 @@ import argparse
 import logging
 from audio_detect import audio_detect
 
-load_dotenv()
-API_KEY = os.getenv("GOOGLE_API_KEY")
-if not API_KEY:
-    sys.exit("Error: GOOGLE_API_KEY not found in environment. Please set it in your .env file.")
-
-# Check for an optional CLI argument for the save directory.
-if len(sys.argv) > 1:
-    save_dir = sys.argv[1]
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-else:
-    save_dir = os.getcwd()
-
+# Constants
 CHUNK_DURATION = 5
 SAMPLE_RATE = 16000
 CHANNELS = 1
 
 class AudioRecorder:
-    def __init__(self, save_dir=None, debug=False, timer_interval=60):
+    def __init__(self, save_dir=None, debug=False, timer_interval=60, api_key=None):
         self.save_dir = save_dir or os.getcwd()
         self.model = load_silero_vad()
-        self.client = genai.Client(api_key=API_KEY)
+        self.client = genai.Client(api_key=api_key)
         self.mic_queue = Queue()
         self.sys_queue = Queue()
         self._running = True
@@ -361,16 +349,41 @@ class AudioRecorder:
             logging.error(f"Error during recording: {e}")
 
 def main():
+    # 1. Load environment
+    load_dotenv()
+
+    # 2. Parse CLI arguments
     parser = argparse.ArgumentParser(description="Record audio and transcribe using Gemini API.")
     parser.add_argument("save_dir", nargs="?", default=None, help="Directory to save audio and transcriptions.")
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug mode (save audio buffers).")
     parser.add_argument("-t", "--timer_interval", type=int, default=60, help="Timer interval in seconds.")
     args = parser.parse_args()
     
+    # Set up logging
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
     
-    recorder = AudioRecorder(args.save_dir, args.debug, args.timer_interval)
-    recorder.detect()
+    # 3. Validate environment variables (API_KEY)
+    API_KEY = os.getenv("GOOGLE_API_KEY")
+    if not API_KEY:
+        sys.exit("Error: GOOGLE_API_KEY not found in environment. Please set it in your .env file.")
+    
+    # Create save directory if needed
+    if args.save_dir and not os.path.exists(args.save_dir):
+        os.makedirs(args.save_dir)
+    
+    # 4. Create the recorder
+    recorder = AudioRecorder(
+        save_dir=args.save_dir,
+        debug=args.debug,
+        timer_interval=args.timer_interval,
+        api_key=API_KEY
+    )
+    
+    # 5. Detect devices or exit
+    if not recorder.detect():
+        sys.exit("No suitable audio devices found.")
+    
+    # 6. Start recording
     recorder.start()
 
 if __name__ == "__main__":
