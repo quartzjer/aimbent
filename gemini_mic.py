@@ -18,6 +18,7 @@ from pyaec import Aec
 from scipy.fft import rfft, irfft
 import subprocess
 import argparse
+from audio_detect import audio_detect
 
 load_dotenv()
 API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -79,32 +80,16 @@ class VoiceEnhancer:
         # Return the enhanced audio as float32 in the same range as input
         return enhanced.astype(np.float32)
 
-class AudioRecorder:
-    def __init__(self, save_dir=None, debug=False, timer_interval=60):
-        self.save_dir = save_dir or os.getcwd()
-        self.model = load_silero_vad()
-        self.client = genai.Client(api_key=API_KEY)
-        self.devices = self._initialize_devices()
-        self._running = True
-        self.enhancer = VoiceEnhancer(sample_rate=SAMPLE_RATE, boost_factor=2)
-        self.debug = debug
-        
-        # PyAEC parameters
-        self.frame_size = int(0.02 * SAMPLE_RATE)
-        self.filter_length = int(SAMPLE_RATE * 0.2)
-        self.aec = Aec(self.frame_size, self.filter_length, SAMPLE_RATE, True)
-        self.timer_interval = timer_interval
-
     def _initialize_devices(self):
-        mics = sc.all_microphones(include_loopback=True)
-        if len(mics) < 2:
-            raise RuntimeError("At least 2 audio input devices are required!")
+        mic, loopback = audio_detect()
+        if mic is None or loopback is None:
+            raise RuntimeError("Failed to detect required audio devices!")
         print("Using devices:")
-        print(f"Microphone: {mics[0].name}")
-        print(f"System audio: {mics[1].name}")
+        print(f"Microphone: {mic.name}")
+        print(f"System audio: {loopback.name}")
         return {
-            'mic': AudioDevice(mics[0], "microphone"),
-            'sys': AudioDevice(mics[1], "system")
+            'mic': AudioDevice(mic, "microphone"),
+            'sys': AudioDevice(loopback, "system")
         }
 
     def record_from_device(self, device_key):
