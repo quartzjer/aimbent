@@ -18,6 +18,7 @@ from pyaec import Aec
 from scipy.fft import rfft, irfft
 import subprocess
 import argparse
+import logging
 from audio_detect import audio_detect
 
 load_dotenv()
@@ -88,10 +89,10 @@ class AudioRecorder:
     def detect(self):
         mic, loopback = audio_detect()
         if mic is None or loopback is None:
-            print(f"Detection failed: mic {mic} sys {loopback}")
+            logging.error(f"Detection failed: mic {mic} sys {loopback}")
             return False
-        print(f"Detected microphone: {mic.name}")
-        print(f"Detected system audio: {loopback.name}")
+        logging.info(f"Detected microphone: {mic.name}")
+        logging.info(f"Detected system audio: {loopback.name}")
         self.mic_device = mic
         self.sys_device = loopback
         return True
@@ -105,18 +106,18 @@ class AudioRecorder:
                         if recording is not None and recording.size > 0:
                             queue.put(recording)
                     except Exception as e:
-                        print(f"Error recording from {label}: {e}")
+                        logging.error(f"Error recording from {label}: {e}")
                         if not self._running:
                             break
                         time.sleep(0.5)
         except Exception as e:
-            print(f"Error setting up recorder for {label}: {e}")
+            logging.error(f"Error setting up recorder for {label}: {e}")
             if self._running:
-                print(f"Recording thread for {label} crashed: {e}")
+                logging.error(f"Recording thread for {label} crashed: {e}")
 
     def detect_speech(self, label, buffer_data):
         if buffer_data is None or len(buffer_data) == 0:
-            print(f"No audio data found in {label} buffer.")
+            logging.info(f"No audio data found in {label} buffer.")
             return [], np.array([], dtype=np.float32)
 
         speech_segments = get_speech_timestamps(
@@ -129,13 +130,13 @@ class AudioRecorder:
             threshold=0.3
         )
         buffer_seconds = len(buffer_data) / SAMPLE_RATE
-        print(f"Detected {len(speech_segments)} speech segments in {label} of {buffer_seconds:.1f} seconds.")
+        logging.info(f"Detected {len(speech_segments)} speech segments in {label} of {buffer_seconds:.1f} seconds.")
         if self.debug:
             debug_filename = f"test_{label}.ogg"
             debug_data = self.create_ogg_bytes([{"data": buffer_data}])
             with open(debug_filename, "wb") as f:
                 f.write(debug_data)
-            print(f"Saved debug file: {debug_filename}")
+            logging.debug(f"Saved debug file: {debug_filename}")
 
         segments = []
         total_duration = len(buffer_data) / SAMPLE_RATE
@@ -145,7 +146,7 @@ class AudioRecorder:
             if i == len(speech_segments) - 1 and total_duration - seg['end'] < 1:
                 start_idx = int(seg['start'] * SAMPLE_RATE)
                 unprocessed_data = buffer_data[start_idx:]
-                print(f"Unprocessed segment at end of {label} buffer of length {len(unprocessed_data)/SAMPLE_RATE:.1f} seconds.")
+                logging.debug(f"Unprocessed segment at end of {label} buffer of length {len(unprocessed_data)/SAMPLE_RATE:.1f} seconds.")
                 break
             start_idx = int(seg['start'] * SAMPLE_RATE)
             end_idx = int(seg['end'] * SAMPLE_RATE)
@@ -158,7 +159,7 @@ class AudioRecorder:
 
     def transcribe(self, ogg_bytes):
         size_mb = len(ogg_bytes) / (1024 * 1024)
-        print(f"Transcribing chunk: {size_mb:.2f}MB")
+        logging.info(f"Transcribing chunk: {size_mb:.2f}MB")
         
         with open("gemini_mic.txt", "r") as f:
             prompt_text = f.read().strip()
@@ -179,7 +180,7 @@ class AudioRecorder:
             )
             return response.text
         except Exception as e:
-            print(f"Error during transcription: {e}")
+            logging.error(f"Error during transcription: {e}")
             return ""
 
     def calculate_rms(self, audio_buffer):
@@ -208,7 +209,7 @@ class AudioRecorder:
             )
             return "Mute: yes" in result.stdout
         except subprocess.SubprocessError as e:
-            print(f"Error checking system mute status: {e}")
+            logging.error(f"Error checking system mute status: {e}")
             return False
 
     def get_buffer(self, queue):
@@ -225,15 +226,15 @@ class AudioRecorder:
     def apply_echo_cancellation(self, mic_buffer, sys_buffer):
         min_length = min(len(mic_buffer), len(sys_buffer))
         if min_length == 0:
-            print("Missing audio data in one or both buffers.")
+            logging.info("Missing audio data in one or both buffers.")
             return mic_buffer
 
         sys_rms = self.calculate_rms(sys_buffer)
         if sys_rms < 0.01:
-            print("System audio is silent.")
+            logging.info("System audio is silent.")
             return mic_buffer
 
-        print(f"Echo cancelling mic seconds {len(mic_buffer)/SAMPLE_RATE:.4f} sys seconds {len(sys_buffer)/SAMPLE_RATE:.4f}")        
+        logging.info(f"Echo cancelling mic seconds {len(mic_buffer)/SAMPLE_RATE:.4f} sys seconds {len(sys_buffer)/SAMPLE_RATE:.4f}")        
 
         # Convert float32 arrays to int16 (required by PyAEC)
         mic_int16 = (mic_buffer * 32767).astype(np.int16)
@@ -263,7 +264,7 @@ class AudioRecorder:
         # Only enhance/normalize if we're doing echo cancellation
         processed_mic = self.enhance_voice(processed_mic)
         processed_mic = self.normalize_audio(processed_mic, sys_rms)
-        print(f"Normalized microphone audio to match system RMS: {sys_rms:.6f}")
+        logging.info(f"Normalized microphone audio to match system RMS: {sys_rms:.6f}")
         
         return processed_mic
 
@@ -294,7 +295,7 @@ class AudioRecorder:
         while self._running:
             time.sleep(self.timer_interval)
             system_muted = self.is_system_muted()
-            print(f"System audio mute status: {'Muted' if system_muted else 'Not muted'}")
+            logging.info(f"System audio mute status: {'Muted' if system_muted else 'Not muted'}")
             new_mic = self.get_buffer(self.mic_queue)
             new_sys = self.get_buffer(self.sys_queue)
             if system_muted:
@@ -303,15 +304,15 @@ class AudioRecorder:
                 mic_segments, unprocessed_mic = self.detect_speech("mic", mic_buffer)
                 if mic_segments:
                     self.process_segments_and_transcribe(mic_segments, suffix="_mic")
-                    print(f"Found {len(mic_segments)} microphone segments")
+                    logging.info(f"Found {len(mic_segments)} microphone segments")
                 else:
-                    print("No microphone segments found")
+                    logging.info("No microphone segments found")
                 sys_segments, unprocessed_sys = self.detect_speech("sys", sys_buffer)
                 if sys_segments:
                     self.process_segments_and_transcribe(sys_segments, suffix="_sys")
-                    print(f"Found {len(sys_segments)} system audio segments")
+                    logging.info(f"Found {len(sys_segments)} system audio segments")
                 else:
-                    print("No system audio segments found")
+                    logging.info("No system audio segments found")
                 mic_buffer = unprocessed_mic
                 sys_buffer = unprocessed_sys
             else:
@@ -323,7 +324,7 @@ class AudioRecorder:
                 sys_segments, unprocessed_sys = self.detect_speech("sys", sys_buffer)
                 segments_all.extend(mic_segments)
                 segments_all.extend(sys_segments)
-                print(f"Found {len(mic_segments)} microphone and {len(sys_segments)} system segments.")
+                logging.info(f"Found {len(mic_segments)} microphone and {len(sys_segments)} system segments.")
                 if segments_all:
                     segments_all.sort(key=lambda seg: seg["offset"]) # weave together in time
                     self.process_segments_and_transcribe(segments_all)
@@ -338,7 +339,7 @@ class AudioRecorder:
             f.write(ogg_bytes)
         with open(json_filepath, "w") as f:
             json.dump({"text": response_text}, f)
-        print(f"Saved to {ogg_filepath}: {response_text}")
+        logging.info(f"Saved to {ogg_filepath}: {response_text}")
 
     def start(self):
         threads = [
@@ -354,10 +355,10 @@ class AudioRecorder:
                 time.sleep(1)
         except KeyboardInterrupt:
             self._running = False
-            print("\nRecording stopped (Ctrl+C pressed)")
+            logging.info("\nRecording stopped (Ctrl+C pressed)")
         except Exception as e:
             self._running = False
-            print(f"Error during recording: {e}")
+            logging.error(f"Error during recording: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description="Record audio and transcribe using Gemini API.")
@@ -365,7 +366,9 @@ def main():
     parser.add_argument("-d", "--debug", action="store_true", help="Enable debug mode (save audio buffers).")
     parser.add_argument("-t", "--timer_interval", type=int, default=60, help="Timer interval in seconds.")
     args = parser.parse_args()
-
+    
+    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
+    
     recorder = AudioRecorder(args.save_dir, args.debug, args.timer_interval)
     recorder.detect()
     recorder.start()
