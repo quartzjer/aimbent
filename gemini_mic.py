@@ -132,8 +132,9 @@ class AudioRecorder:
         print(f"Detected {len(speech_segments)} speech segments in {label} of {buffer_seconds:.1f} seconds.")
         if self.debug:
             debug_filename = f"test_{label}.ogg"
-            debug_data = (np.clip(buffer_data, -1.0, 1.0) * 32767).astype(np.int16)
-            sf.write(debug_filename, debug_data, SAMPLE_RATE, format='OGG', subtype='VORBIS')
+            debug_data = self.create_ogg_bytes([{"data": buffer_data}])
+            with open(debug_filename, "wb") as f:
+                f.write(debug_data)
             print(f"Saved debug file: {debug_filename}")
 
         segments = []
@@ -266,30 +267,26 @@ class AudioRecorder:
         
         return processed_mic
 
-    def process_segments_and_transcribe(self, segments, suffix=None):
-        if not segments:
-            return
-            
-        # Concatenate all segments
+    def create_ogg_bytes(self, segments: list) -> bytes:
+        # Concatenate audio data from segments
         combined = np.concatenate([seg["data"] for seg in segments])
+        # Convert to int16 format
         chunk_int16 = (np.clip(combined, -1.0, 1.0) * 32767).astype(np.int16)
-        
-        # Create OGG file
+        # Write to an in-memory OGG buffer
         buf = io.BytesIO()
         audio_data = chunk_int16.reshape(-1, CHANNELS)
         sf.write(buf, audio_data, SAMPLE_RATE, format='OGG', subtype='VORBIS')
-        ogg_bytes = buf.getvalue()
-        
-        # Transcribe audio
-        response_text = self.transcribe(ogg_bytes)
+        return buf.getvalue()
+
+    def process_segments_and_transcribe(self, segments, suffix=None):
+        if not segments:
+            return
+        ogg_bytes = self.create_ogg_bytes(segments)
+        transcription = self.transcribe(ogg_bytes)
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # Add suffix if provided
         if suffix:
             timestamp += suffix
-            
-        # Save results
-        self.save_results(timestamp, ogg_bytes, response_text)
+        self.save_results(timestamp, ogg_bytes, transcription)
 
     def speech_processing_timer(self):
         mic_buffer = np.array([], dtype=np.float32)
