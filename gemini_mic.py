@@ -37,21 +37,15 @@ CHUNK_DURATION = 5
 SAMPLE_RATE = 16000
 CHANNELS = 1
 
-class AudioDevice:
-    def __init__(self, device, label):
-        self.device = device
-        self.label = label
-        self.queue = Queue()
-
-    def queue_chunk(self, audio_data):
-        self.queue.put(audio_data)
-
 class AudioRecorder:
     def __init__(self, save_dir=None, debug=False, timer_interval=60):
         self.save_dir = save_dir or os.getcwd()
         self.model = load_silero_vad()
         self.client = genai.Client(api_key=API_KEY)
-        self.devices = self._initialize_devices()
+        # Initialize devices and separate queues for mic and system audio
+        self.mic_device, self.sys_device = self._initialize_devices()
+        self.mic_queue = Queue()
+        self.sys_queue = Queue()
         self._running = True
         self.debug = debug
         
@@ -100,38 +94,32 @@ class AudioRecorder:
         print("Using devices:")
         print(f"Microphone: {mic.name}")
         print(f"System audio: {loopback.name}")
-        return {
-            'mic': AudioDevice(mic, "microphone"),
-            'sys': AudioDevice(loopback, "system")
-        }
+        return mic, loopback
 
-    def record_from_device(self, device_key):
-        """Record from a specific device using non-blocking pattern."""
-        device = self.devices[device_key]
-        print(f"Starting recording thread for {device.label}: {device.device.name}")
-        
+    # New generic recording method accepting device, queue and label.
+    def record_device(self, device, queue, label):
+        print(f"Starting recording thread for {label}: {device.name}")
         try:
-            with device.device.recorder(samplerate=SAMPLE_RATE, channels=[-1]) as recorder:
+            with device.recorder(samplerate=SAMPLE_RATE, channels=[-1]) as recorder:
                 while self._running:
                     try:
                         recording = recorder.record(numframes=None)
-                        
                         if recording is not None and recording.size > 0:
-                            device.queue_chunk(recording)
-                            #print(f"Queued {len(recording) / SAMPLE_RATE:.4f} seconds from {device.label}")
+                            queue.put(recording)
                     except Exception as e:
-                        print(f"Error recording from {device.label}: {e}")
+                        print(f"Error recording from {label}: {e}")
                         if not self._running:
                             break
                         time.sleep(0.5)
         except Exception as e:
-            print(f"Error setting up recorder for {device.label}: {e}")
-            if self._running:  # Only log if not due to shutdown
-                print(f"Recording thread for {device.label} crashed: {e}")
+            print(f"Error setting up recorder for {label}: {e}")
+            if self._running:
+                print(f"Recording thread for {label} crashed: {e}")
 
-    def process_buffer(self, device_key, buffer_data):
+    # Updated process_buffer to accept label directly.
+    def process_buffer(self, label, buffer_data):
         if buffer_data is None or len(buffer_data) == 0:
-            return []
+            return [], np.array([], dtype=np.float32)
             
         speech_segments = get_speech_timestamps(
             buffer_data, self.model,
@@ -143,10 +131,9 @@ class AudioRecorder:
             threshold=0.3
         )
         buffer_seconds = len(buffer_data) / SAMPLE_RATE
-        print(f"Detected {len(speech_segments)} speech segments in {self.devices[device_key].label} of {buffer_seconds:.1f} seconds.")
-        # Debug: Save buffer to file
+        print(f"Detected {len(speech_segments)} speech segments in {label} of {buffer_seconds:.1f} seconds.")
         if self.debug:
-            debug_filename = f"test_{self.devices[device_key].label}.ogg"
+            debug_filename = f"test_{label}.ogg"
             debug_data = (np.clip(buffer_data, -1.0, 1.0) * 32767).astype(np.int16)
             sf.write(debug_filename, debug_data, SAMPLE_RATE, format='OGG', subtype='VORBIS')
             print(f"Saved debug file: {debug_filename}")
@@ -156,20 +143,18 @@ class AudioRecorder:
         unprocessed_data = np.array([], dtype=np.float32)
 
         for i, seg in enumerate(speech_segments):
-            # If the last segment is too close to the end the speaking might be continuing
             if i == len(speech_segments) - 1 and total_duration - seg['end'] < 1:
                 start_idx = int(seg['start'] * SAMPLE_RATE)
                 unprocessed_data = buffer_data[start_idx:]
-                print(f"Unprocessed segment at end of {self.devices[device_key].label} buffer of length {len(unprocessed_data)/SAMPLE_RATE:.1f} seconds.")
+                print(f"Unprocessed segment at end of {label} buffer of length {len(unprocessed_data)/SAMPLE_RATE:.1f} seconds.")
                 break
             start_idx = int(seg['start'] * SAMPLE_RATE)
             end_idx = int(seg['end'] * SAMPLE_RATE)
             seg_data = buffer_data[start_idx:end_idx]
             segments.append({
-                "offset": seg['start'],  # Store offset in seconds from buffer start
+                "offset": seg['start'],
                 "data": seg_data
             })
-        
         return segments, unprocessed_data
 
     def transcribe(self, ogg_bytes):
@@ -231,18 +216,15 @@ class AudioRecorder:
             return False
 
     def get_device_buffers(self):
-        mic_device = self.devices['mic']
-        sys_device = self.devices['sys']
-        
         mic_buffer = np.array([], dtype=np.float32)
         sys_buffer = np.array([], dtype=np.float32)
         
-        while not sys_device.queue.empty():
-            chunk = sys_device.queue.get()
+        while not self.sys_queue.empty():
+            chunk = self.sys_queue.get()
             sys_buffer = np.concatenate((sys_buffer, chunk.squeeze(axis=1)))
 
-        while not mic_device.queue.empty():
-            chunk = mic_device.queue.get()
+        while not self.mic_queue.empty():
+            chunk = self.mic_queue.get()
             mic_buffer = np.concatenate((mic_buffer, chunk.squeeze(axis=1)))
         
         return mic_buffer, sys_buffer
@@ -325,63 +307,44 @@ class AudioRecorder:
         self.save_results(timestamp, ogg_bytes, response_text)
 
     def speech_processing_timer(self):
-        # Initialize local buffers
         mic_buffer = np.array([], dtype=np.float32)
         sys_buffer = np.array([], dtype=np.float32)
-        
         while self._running:
             time.sleep(self.timer_interval)
-            
             system_muted = self.is_system_muted()
             print(f"System audio mute status: {'Muted' if system_muted else 'Not muted'}")
-            
-            # Get new audio data and add to existing buffers
             new_mic, new_sys = self.get_device_buffers()
-
-            # If system speaker is muted (no echo), process audio separately
             if system_muted:
                 mic_buffer = np.concatenate((mic_buffer, new_mic)) if mic_buffer.size > 0 else new_mic
                 sys_buffer = np.concatenate((sys_buffer, new_sys)) if sys_buffer.size > 0 else new_sys
-
-                mic_segments, unprocessed_mic = self.process_buffer('mic', mic_buffer)
+                mic_segments, unprocessed_mic = self.process_buffer("mic", mic_buffer)
                 if mic_segments:
                     self.process_segments_and_transcribe(mic_segments, suffix="_mic")
                     print(f"Found {len(mic_segments)} microphone segments")
                 else:
                     print("No microphone segments found")
-                
-                sys_segments, unprocessed_sys = self.process_buffer('sys', sys_buffer)
+                sys_segments, unprocessed_sys = self.process_buffer("sys", sys_buffer)
                 if sys_segments:
                     self.process_segments_and_transcribe(sys_segments, suffix="_sys")
                     print(f"Found {len(sys_segments)} system audio segments")
                 else:
                     print("No system audio segments found")
-                
-                # Retain unprocessed audio for next cycle
                 mic_buffer = unprocessed_mic
                 sys_buffer = unprocessed_sys
             else:
-                # Speaker is on, apply echo cancellation
                 new_mic = self.apply_echo_cancellation(new_mic, new_sys)
-
                 mic_buffer = np.concatenate((mic_buffer, new_mic)) if mic_buffer.size > 0 else new_mic
                 sys_buffer = np.concatenate((sys_buffer, new_sys)) if sys_buffer.size > 0 else new_sys
-
-                # Merge all segments from both devices
                 segments_all = []
-                mic_segments, unprocessed_mic = self.process_buffer('mic', mic_buffer)
-                sys_segments, unprocessed_sys = self.process_buffer('sys', sys_buffer)
+                mic_segments, unprocessed_mic = self.process_buffer("mic", mic_buffer)
+                sys_segments, unprocessed_sys = self.process_buffer("sys", sys_buffer)
                 segments_all.extend(mic_segments)
                 segments_all.extend(sys_segments)
-
                 print(f"Processed {len(mic_segments)} segments from microphone.")
                 print(f"Processed {len(sys_segments)} segments from system audio.")
-
                 if segments_all:
                     segments_all.sort(key=lambda seg: seg["offset"])
                     self.process_segments_and_transcribe(segments_all)
-                
-                # Retain unprocessed audio for next cycle
                 mic_buffer = unprocessed_mic
                 sys_buffer = unprocessed_sys
 
@@ -397,8 +360,8 @@ class AudioRecorder:
 
     def start(self):
         threads = [
-            threading.Thread(target=self.record_from_device, args=('mic',), daemon=True),
-            threading.Thread(target=self.record_from_device, args=('sys',), daemon=True),
+            threading.Thread(target=self.record_device, args=(self.mic_device, self.mic_queue, "mic"), daemon=True),
+            threading.Thread(target=self.record_device, args=(self.sys_device, self.sys_queue, "sys"), daemon=True),
             threading.Thread(target=self.speech_processing_timer, daemon=True)
         ]
         for thread in threads:
