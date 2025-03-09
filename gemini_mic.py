@@ -116,8 +116,7 @@ class AudioRecorder:
             if self._running:
                 print(f"Recording thread for {label} crashed: {e}")
 
-    # Updated process_buffer to accept label directly.
-    def process_buffer(self, label, buffer_data):
+    def detect_speech(self, label, buffer_data):
         if buffer_data is None or len(buffer_data) == 0:
             return [], np.array([], dtype=np.float32)
             
@@ -236,6 +235,11 @@ class AudioRecorder:
             print("Missing audio data in one or both buffers.")
             return mic_buffer, sys_buffer
 
+        sys_rms = self.calculate_rms(sys_buffer)
+        if sys_rms < 0.01:
+            print("System audio is silent.")
+            return mic_buffer, sys_buffer
+
         print(f"echo cancelling mic seconds {len(mic_buffer)/SAMPLE_RATE:.4f} sys seconds {len(sys_buffer)/SAMPLE_RATE:.4f}")        
 
         # Convert float32 arrays to int16 (required by PyAEC)
@@ -265,25 +269,14 @@ class AudioRecorder:
         
         # Only enhance/normalize if we're doing echo cancellation
         processed_mic = self.enhance_voice(processed_mic)
-        sys_rms = self.calculate_rms(sys_buffer)
-        if sys_rms > 0:
-            processed_mic = self.normalize_audio(processed_mic, sys_rms)
-            print(f"Normalized microphone audio to match system RMS: {sys_rms:.6f}")
+        processed_mic = self.normalize_audio(processed_mic, sys_rms)
+        print(f"Normalized microphone audio to match system RMS: {sys_rms:.6f}")
         
         return processed_mic
 
     def process_segments_and_transcribe(self, segments, suffix=None):
-        """Process audio segments, transcribe, and save results.
-        
-        Args:
-            segments: List of audio segment dictionaries with 'data' and 'offset' keys
-            suffix: Optional suffix to append to the filename (e.g., '_mic')
-        """
         if not segments:
             return
-            
-        # Sort segments based only on time offset
-        segments.sort(key=lambda seg: seg["offset"])
             
         # Concatenate all segments
         combined = np.concatenate([seg["data"] for seg in segments])
@@ -317,13 +310,13 @@ class AudioRecorder:
             if system_muted:
                 mic_buffer = np.concatenate((mic_buffer, new_mic)) if mic_buffer.size > 0 else new_mic
                 sys_buffer = np.concatenate((sys_buffer, new_sys)) if sys_buffer.size > 0 else new_sys
-                mic_segments, unprocessed_mic = self.process_buffer("mic", mic_buffer)
+                mic_segments, unprocessed_mic = self.detect_speech("mic", mic_buffer)
                 if mic_segments:
                     self.process_segments_and_transcribe(mic_segments, suffix="_mic")
                     print(f"Found {len(mic_segments)} microphone segments")
                 else:
                     print("No microphone segments found")
-                sys_segments, unprocessed_sys = self.process_buffer("sys", sys_buffer)
+                sys_segments, unprocessed_sys = self.detect_speech("sys", sys_buffer)
                 if sys_segments:
                     self.process_segments_and_transcribe(sys_segments, suffix="_sys")
                     print(f"Found {len(sys_segments)} system audio segments")
@@ -336,14 +329,13 @@ class AudioRecorder:
                 mic_buffer = np.concatenate((mic_buffer, new_mic)) if mic_buffer.size > 0 else new_mic
                 sys_buffer = np.concatenate((sys_buffer, new_sys)) if sys_buffer.size > 0 else new_sys
                 segments_all = []
-                mic_segments, unprocessed_mic = self.process_buffer("mic", mic_buffer)
-                sys_segments, unprocessed_sys = self.process_buffer("sys", sys_buffer)
+                mic_segments, unprocessed_mic = self.detect_speech("mic", mic_buffer)
+                sys_segments, unprocessed_sys = self.detect_speech("sys", sys_buffer)
                 segments_all.extend(mic_segments)
                 segments_all.extend(sys_segments)
-                print(f"Processed {len(mic_segments)} segments from microphone.")
-                print(f"Processed {len(sys_segments)} segments from system audio.")
+                print(f"Found {len(mic_segments)} microphon and {len(sys_segments)} system segments.")
                 if segments_all:
-                    segments_all.sort(key=lambda seg: seg["offset"])
+                    segments_all.sort(key=lambda seg: seg["offset"]) # weave together in time
                     self.process_segments_and_transcribe(segments_all)
                 mic_buffer = unprocessed_mic
                 sys_buffer = unprocessed_sys
