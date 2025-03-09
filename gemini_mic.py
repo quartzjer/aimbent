@@ -46,14 +46,27 @@ class AudioDevice:
     def queue_chunk(self, audio_data):
         self.queue.put(audio_data)
 
-class VoiceEnhancer:
-    def __init__(self, sample_rate=16000, min_freq=300, max_freq=3400, boost_factor=1.5):
-        self.sample_rate = sample_rate
-        self.min_freq = min_freq
-        self.max_freq = max_freq
-        self.boost_factor = boost_factor
-    
-    def process(self, audio):
+class AudioRecorder:
+    def __init__(self, save_dir=None, debug=False, timer_interval=60):
+        self.save_dir = save_dir or os.getcwd()
+        self.model = load_silero_vad()
+        self.client = genai.Client(api_key=API_KEY)
+        self.devices = self._initialize_devices()
+        self._running = True
+        self.debug = debug
+        
+        # Voice enhancement parameters
+        self.min_freq = 300
+        self.max_freq = 3400
+        self.boost_factor = 2
+        
+        # PyAEC parameters
+        self.frame_size = int(0.02 * SAMPLE_RATE)
+        self.filter_length = int(SAMPLE_RATE * 0.2)
+        self.aec = Aec(self.frame_size, self.filter_length, SAMPLE_RATE, True)
+        self.timer_interval = timer_interval
+
+    def enhance_voice(self, audio):
         if len(audio) == 0:
             return audio
 
@@ -62,11 +75,11 @@ class VoiceEnhancer:
         audio = np.where(audio == 0, 1e-10, audio)
 
         # Apply noise reduction
-        audio = reduce_noise(y=audio, sr=self.sample_rate)
+        audio = reduce_noise(y=audio, sr=SAMPLE_RATE)
 
         # Compute the FFT
         X = rfft(audio)
-        freqs = np.fft.rfftfreq(len(audio), d=1/self.sample_rate)
+        freqs = np.fft.rfftfreq(len(audio), d=1/SAMPLE_RATE)
         
         # Define vocal range mask
         vocal_mask = (freqs >= self.min_freq) & (freqs <= self.max_freq)
@@ -269,7 +282,7 @@ class VoiceEnhancer:
         processed_mic = np.concatenate(processed_chunks).astype(np.float32) / 32767.0
         
         # Only enhance/normalize if we're doing echo cancellation
-        processed_mic = self.enhancer.process(processed_mic)
+        processed_mic = self.enhance_voice(processed_mic)
         sys_rms = self.calculate_rms(sys_buffer)
         if sys_rms > 0:
             processed_mic = self.normalize_audio(processed_mic, sys_rms)
