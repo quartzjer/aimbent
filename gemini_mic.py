@@ -188,7 +188,8 @@ class AudioRecorder:
         gain_factor = target_rms / current_rms
         return audio * gain_factor
 
-    def is_system_muted(self):
+    def is_system_muted(self, audio_buffer=None):
+        # Check if system is muted via pulseaudio
         try:
             result = subprocess.run(
                 ["pactl", "get-sink-mute", "@DEFAULT_SINK@"], 
@@ -196,10 +197,20 @@ class AudioRecorder:
                 text=True, 
                 check=True
             )
-            return "Mute: yes" in result.stdout
+            pactl_muted = "Mute: yes" in result.stdout
         except subprocess.SubprocessError as e:
             logging.error(f"Error checking system mute status: {e}")
-            return False
+            pactl_muted = False
+        
+        # Check if audio buffer is silent
+        silent = False
+        if audio_buffer is not None and len(audio_buffer) > 0:
+            rms = self.calculate_rms(audio_buffer)
+            silent = rms < 0.005  # Threshold for considering audio as silent
+            if silent:
+                logging.info(f"System audio silent (RMS: {rms:.6f})")
+        
+        return pactl_muted or silent
 
     def get_buffer(self, queue):
         buffer = np.array([], dtype=np.float32)
@@ -288,12 +299,13 @@ class AudioRecorder:
         sys_stash = np.array([], dtype=np.float32)
         while self._running:
             time.sleep(self.timer_interval)
-            system_muted = self.is_system_muted()
-            logging.info(f"System audio mute status: {'Muted' if system_muted else 'Not muted'}")
 
             sys_new = self.get_buffer(self.sys_queue)
             sys_segments, sys_stash = self.process_buffer(sys_stash, sys_new, "sys")
             mic_new = self.get_buffer(self.mic_queue)
+
+            system_muted = self.is_system_muted(sys_new)
+            logging.info(f"System audio mute status: {'Muted' if system_muted else 'Not muted'}")
 
             if system_muted:
                 mic_segments, mic_stash = self.process_buffer(mic_stash, mic_new, "mic")
