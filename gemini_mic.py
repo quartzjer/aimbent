@@ -161,7 +161,7 @@ class AudioRecorder:
                     types.Part.from_bytes(data=ogg_bytes, mime_type="audio/ogg")
                 ],
                 config=types.GenerateContentConfig(
-                    temperature=0.5,
+                    temperature=0.3,
                     max_output_tokens=8192,
                     response_mime_type="application/json",
                     system_instruction=prompt_text
@@ -206,7 +206,7 @@ class AudioRecorder:
         silent = False
         if audio_buffer is not None and len(audio_buffer) > 0:
             rms = self.calculate_rms(audio_buffer)
-            silent = rms < 0.005  # Threshold for considering audio as silent
+            silent = rms < 0.0001
             if silent:
                 logging.info(f"System audio silent (RMS: {rms:.6f})")
         
@@ -227,11 +227,6 @@ class AudioRecorder:
         min_length = min(len(mic_buffer), len(sys_buffer))
         if min_length == 0:
             logging.info("Missing audio data in one or both buffers.")
-            return mic_buffer
-
-        sys_rms = self.calculate_rms(sys_buffer)
-        if sys_rms < 0.01:
-            logging.info("System audio is silent.")
             return mic_buffer
 
         logging.info(f"Echo cancelling mic seconds {len(mic_buffer)/SAMPLE_RATE:.4f} sys seconds {len(sys_buffer)/SAMPLE_RATE:.4f}")        
@@ -263,8 +258,11 @@ class AudioRecorder:
         
         # Only enhance/normalize if we're doing echo cancellation
         processed_mic = self.enhance_voice(processed_mic)
-        processed_mic = self.normalize_audio(processed_mic, sys_rms)
-        logging.info(f"Normalized microphone audio to match system RMS: {sys_rms:.6f}")
+        sys_rms = self.calculate_rms(sys_buffer)
+        mic_rms = self.calculate_rms(processed_mic)
+        logging.info(f"System RMS: {sys_rms:.6f} Microphone RMS: {mic_rms:.6f}")
+        # if sys_rms > mic_rms and mic_rms > 0.01:
+        #     processed_mic = self.normalize_audio(processed_mic, sys_rms)
         
         return processed_mic
 
@@ -281,6 +279,10 @@ class AudioRecorder:
 
     def process_segments_and_transcribe(self, segments, suffix=None):
         if not segments:
+            return
+        total_seconds = sum([len(seg["data"]) / SAMPLE_RATE for seg in segments])
+        if total_seconds < 3:
+            logging.info(f"Skipping processing of {total_seconds:.1f} seconds of audio.")
             return
         ogg_bytes = self.create_ogg_bytes(segments)
         transcription = self.transcribe(ogg_bytes)
