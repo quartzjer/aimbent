@@ -42,6 +42,7 @@ def gemini_describe_region(image, box):
     Crops the image using native pixel coordinates from box,
     computes normalized coordinates once for the Gemini call, and then
     sends both full image and crop to Gemini.
+    Retries with a fallback model if the primary model fails.
     """
     # Ensure the module is initialized
     if _gemini_client is None:
@@ -58,19 +59,25 @@ def gemini_describe_region(image, box):
     prompt = (
         "Here is the latest screenshot with the cropped region of interest, please return the complete JSON as instructed."
     )
-    try:
-        response = _gemini_client.models.generate_content(
-            #model="gemini-2.0-pro-exp-02-05",
-            model="gemini-2.0-flash",
-            contents=[prompt, im_with_box, cropped],
-            config=types.GenerateContentConfig(
-                temperature=0.5,
-                max_output_tokens=8192,
-                response_mime_type="application/json",
-                system_instruction=_system_instruction
+    
+    models_to_try = ["gemini-2.0-flash", "gemini-2.0-flash-lite"]
+    
+    for model_name in models_to_try:
+        try:
+            response = _gemini_client.models.generate_content(
+                model=model_name,
+                contents=[prompt, im_with_box, cropped],
+                config=types.GenerateContentConfig(
+                    temperature=0.5,
+                    max_output_tokens=8192,
+                    response_mime_type="application/json",
+                    system_instruction=_system_instruction
+                )
             )
-        )
-        return json.loads(response.text)
-    except Exception as e:
-        print(f"Error from Gemini API: {e}")
-        return None
+            return json.loads(response.text)
+        except Exception as e:
+            print(f"Error from Gemini API with model {model_name}: {e}")
+            if model_name == models_to_try[-1]: # If it's the last model in the list
+                return None # All retries failed
+            # Otherwise, loop will continue to the next model
+    return None
