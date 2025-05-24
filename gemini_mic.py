@@ -155,7 +155,7 @@ class AudioRecorder:
             
         try:
             response = self.client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-2.5-flash-preview-05-20",#"gemini-2.0-flash",
                 contents=[
                     "Process the provided audio now and output your professional accurate transcription in the specified JSON format.",
                     types.Part.from_bytes(data=ogg_bytes, mime_type="audio/ogg")
